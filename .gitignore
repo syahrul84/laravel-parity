@@ -1,0 +1,7 @@
+runs/
+target/
+# your own pair files stay on this machine; only the example is shared
+pairs/*
+!pairs/example.toml
+# internal planning notes
+docs/PLAN-*.md

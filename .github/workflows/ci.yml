@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # nightly: the runner against Laravel's development branch, so a new Laravel version's changes show up
+    # before it is released
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: cargo fmt --all -- --check
+        if: runner.os == 'Linux'
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+  # the PHP runner on each Laravel version: every internal it reads must exist, and a request must replay
+  laravel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { laravel: "9.*", php: "8.1" }
+          - { laravel: "10.*", php: "8.2" }
+          - { laravel: "11.*", php: "8.3" }
+          - { laravel: "12.*", php: "8.4" }
+          - { laravel: "13.*", php: "8.5" }
+          - { laravel: "dev-master", php: "8.5", nightly: true }
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'schedule' || matrix.nightly
+      - uses: shivammathur/setup-php@v2
+        if: github.event_name != 'schedule' || matrix.nightly
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_sqlite
+          coverage: none
+      - name: Laravel ${{ matrix.laravel }} app
+        if: github.event_name != 'schedule' || matrix.nightly
+        run: |
+          # every Laravel 9-11 release has a security advisory, which Composer now refuses to install; these apps
+          # only exist to test the runner, so allow them
+          composer config --global audit.block-insecure false
+          if [ "${{ matrix.laravel }}" = dev-master ]; then
+            composer create-project --no-interaction --prefer-dist --stability=dev laravel/laravel "$RUNNER_TEMP/app"
+          else
+            composer create-project --no-interaction --prefer-dist "laravel/laravel:${{ matrix.laravel }}" "$RUNNER_TEMP/app"
+          fi
+          cp tests/fixtures/ParityRoutes.php "$RUNNER_TEMP/app/routes/parity.php"
+          echo "require __DIR__.'/parity.php';" >> "$RUNNER_TEMP/app/routes/web.php"
+      - name: Runner self-check and one replayed request
+        if: github.event_name != 'schedule' || matrix.nightly
+        run: php tests/fixtures/check-runner.php "$RUNNER_TEMP/app"
+      - name: Open an issue when Laravel's development branch breaks the runner
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --state open --search "Laravel development branch breaks the runner" --json number -q '.[0].number' | grep -q . || \
+            gh issue create --title "Laravel development branch breaks the runner" \
+              --body "The nightly check against laravel/laravel dev-master failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

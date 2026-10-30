@@ -1,0 +1,89 @@
+# An example pair file: the old app (before the upgrade) and the new one (after Laravel Shift).
+# `laravel-parity init <old repo> <new repo>` writes one like this for your repos; copy settings from here as needed.
+# No passwords here: the database password comes from PARITY_DB_PASSWORD, else from the old repo's .env.
+
+name = "shop"
+
+[old]
+repo = "~/code/shop-api-old"
+# Docker: the container the app runs in, and the app's path inside it
+container = "shop-old-php"
+app_path = "/var/www/html"
+# Without Docker, the PHP to run it with instead (the app then runs from `repo`), e.g. on Windows:
+# php = "C:/laragon/bin/php/php-8.1.10-Win32-vs16-x64/php.exe"
+setup = [
+    # a Passport personal access client, so the tool can sign in with a real token
+    ["passport:client", { "--personal" = true, "--name" = "laravel-parity", "--no-interaction" = true }],
+]
+
+[new]
+repo = "~/code/shop-api"
+container = "shop-php"
+app_path = "/var/www/html"
+# what the real upgrade does to the old database, run by the new app on its copy
+setup = [
+    # --schema-path: the old database has no migrations table, so Laravel would load database/schema/*.sql over it
+    ["migrate", { "--force" = true, "--schema-path" = "/nonexistent/no-schema-dump.sql" }],
+    ["passport:hash", { "--force" = true }],
+    # Passport 11+ ties a personal client to one user provider: the provider of the guard in [auth] users
+    ["passport:client", { "--personal" = true, "--name" = "laravel-parity", "--provider" = "users", "--no-interaction" = true }],
+]
+
+[database]
+source = "shop"             # the old app's database: copied, never written
+old = "shop_parity_old"     # test databases; dropped and reloaded on every setup-db
+new = "shop_parity_new"
+host = "127.0.0.1"          # as seen from this machine
+port = 3306
+container_host = "host.docker.internal"   # as seen from the containers (a side with php = ... uses host)
+# The new app on another MySQL server (a newer version):
+# [new.database]
+# port = 3307
+
+[auth]
+# guard -> id of the user the requests are made as (an admin, so most routes answer)
+users = { api = 1 }
+# headers every request sends, e.g. the tenant or project the web app has selected
+headers = {}
+
+[run]
+include = ["api/*"]
+exclude = ["api/oauth/*", "POST api/*/logout*", "* api/*/import*"]
+workers = 4                 # PHP processes per app; both apps run at the same time
+# Each route is sent several ways: happy (signed in, a real id, a body that passes validation), guest (not signed
+# in), missing (an id that does not exist), validation (empty body, each required field left out).
+cases = ["happy", "guest", "missing", "validation"]
+# what the web app sends with almost every call; a request's own query/body wins
+query = {}
+body = {}
+
+[compare]
+# key names, or paths starting with $ ([*] = any index)
+ignore_keys = ["created_at", "updated_at", "deleted_at", "*token*", "expires_at", "expires_in", "$.meta.links[*].page"]
+# text that differs by environment, not by code (each app's APP_URL is hidden already)
+mask = []
+
+# route parameters the tool cannot fill: by name, by "METHOD uri", or with a query
+[params]
+# year = "2026"
+# "GET api/reports/{type}" = { type = "summary" }
+# order = "sql:SELECT id FROM orders WHERE status = 'paid' ORDER BY id DESC LIMIT 1"
+
+# The web app, read by codemap (Vue 2, Vue 3, Nuxt, React): the calls the upgrade breaks go in the fix list.
+# [web]
+# old = "~/code/shop-web"
+# new = "~/code/shop-web"   # default: the same as old
+
+[tests]
+dir = "tests/Feature/Parity"
+namespace = "Tests\\Feature\\Parity"
+base_class = "Tests\\TestCase"
+phpunit = "php vendor/bin/phpunit"
+# PHP run before a signed-in case, per guard; it must set $user
+acting_as = { api = "$user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, 'api')" }
+headers = {}
+# what each test sends; PHP expressions on the test's own rows ($user is null when a case is not signed in)
+query = {}
+body = {}
+# factory overrides by column pattern, e.g. { "*team_id" = "$this->team->getKey()" }
+scope = {}
