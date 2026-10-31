@@ -84,6 +84,33 @@ foreach ($modes as $name => $job) {
     }
 }
 
+// the recorder middleware (laravel-parity recorder): a save through it lands in storage/logs/parity-requests.jsonl
+$recorder = dirname(__DIR__, 2).'/php/ParityRecorder.php';
+file_put_contents("$dir/recorder.php", '<?php
+require '.var_export($recorder, true).';
+require '.var_export("$app/vendor/autoload.php", true).';
+$app = require '.var_export("$app/bootstrap/app.php", true).';
+$kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+@unlink(storage_path("logs/parity-requests.jsonl"));
+@unlink(storage_path("logs/parity-requests.seen"));
+$app["router"]->put("parity/units/{unit}", function () { return ["ok" => true]; })
+    ->middleware(App\Http\Middleware\ParityRecorder::class);
+$request = Illuminate\Http\Request::create("/parity/units/7", "PUT", [], [], [], ["CONTENT_TYPE" => "application/json"],
+    json_encode(["name" => "Block A", "password" => "x"]));
+$kernel->handle($request);
+echo file_get_contents(storage_path("logs/parity-requests.jsonl"));
+@unlink(storage_path("logs/parity-requests.jsonl"));
+@unlink(storage_path("logs/parity-requests.seen"));
+');
+$recorded = json_decode(trim((string) shell_exec(sprintf('php %s 2>&1', escapeshellarg("$dir/recorder.php")))), true);
+$ok = ($recorded['route'] ?? null) === 'parity/units/{unit}' && ($recorded['values']['unit'] ?? null) === '7'
+    && ($recorded['body'] ?? null) === ['name' => 'Block A'];
+echo 'recorder: '.($ok ? 'ok' : 'FAILED')."\n";
+if (! $ok) {
+    $failures[] = 'the recorder middleware did not record the save as expected: '.json_encode($recorded);
+}
+
 if ($failures) {
     fwrite(STDERR, "\n".implode("\n", $failures)."\n");
     exit(1);

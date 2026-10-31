@@ -69,11 +69,20 @@ Each route is sent several ways, on both apps, and the old app's answer is the e
 Compared: status code, JSON body (timestamps, tokens and URLs ignored), rows written, queued jobs, mail,
 notifications, broadcasts (event, channel, payload fields), outgoing HTTP calls, and the number of database queries.
 
+When the old app refuses a made-up body (`The posting date field is required.`), the tool fills exactly the fields
+its validation errors name, with values that fit (a real id for `tenant.id`, a date in the asked format, a number for
+an amount) and sends it again, a few rounds (`[run] learn`). A save both apps still refuse is reported as *rejected*:
+not checked, with what the old app still wants. Validation answers sent as status 500 (`Error saving record.` with
+an `errors` list, common in older apps) count as answers, not crashes.
+
 Ids are picked to belong together, like a real user's request: a row of the project / company the pair file sends
 by default, and for `projects/{project}/units/{unit}` a unit of that project (declared foreign keys or the
 `project_id` naming). Real requests can be added from an access log: `laravel-parity import-log pairs/shop.toml
 access.log` turns successful GETs (ids, filters, sorting, paging) into extra cases; values that look like secrets
-are dropped.
+are dropped. An access log has no bodies, so for saves `laravel-parity recorder pairs/shop.toml` writes a small
+middleware to install on a **test or staging** copy of the old app: it records the saves people make there (with
+their bodies, secrets and uploads left out, a few per route), and `import-log` reads its `parity-requests.jsonl` the
+same way.
 
 ## Install
 
@@ -120,7 +129,9 @@ laravel-parity all pairs/shop.toml                     # everything; then open r
 | `console` | the app's commands and queued jobs, run on both apps (time-limited, rolled back), and the schedule |
 | `channels` | who may join each broadcast channel on both apps, /broadcasting/auth, the driver (after `run`) |
 | `tests` | PHPUnit tests for routes without one, run in the new app |
-| `import-log` | real requests from an nginx / Apache access log as extra cases |
+| `import-log` | real requests as extra cases: an nginx / Apache access log, or the recorder's file of real saves |
+| `recorder` | a middleware for a test or staging copy of the old app that records real saves with their bodies |
+| `learn` | fill the fields the old app's validation errors ask for and send again (`run` does this itself) |
 | `overview` | every pair file: where each upgrade stands, closest to release first, and the change since its last run |
 | `baseline` / `ci` | for CI: accept today's findings, then fail the build on a new one (below) |
 | `reports` | problems with the tool itself, which you can send to this repo (you see exactly what is sent first) |
@@ -156,7 +167,7 @@ to use it (upgrades, Laravel Shift, "does the new code behave the same"). The lo
 
 Tools: `guide`, `list_pairs`, `init_pair`, `check`, `setup_db`, `plan`, `run`, `rerun`, `code_check`, `schema_check`,
 `console_check`, `channels_check`, `web_check`, `status`, `summary`, `overview`, `fix_list`, `results`, `show`,
-`set_request`, `import_log`, `generate_tests`, `test_results`, `test_gaps`, `add_case`, `report_problem`. Long steps run as background jobs polled with `status`.
+`set_request`, `learn`, `recorder`, `import_log`, `generate_tests`, `test_results`, `test_gaps`, `add_case`, `report_problem`. Long steps run as background jobs polled with `status`.
 
 ### More test scenarios, written by the AI
 

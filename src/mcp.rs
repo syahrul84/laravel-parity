@@ -53,7 +53,7 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"lines": {"type": "integer", "description": "Progress lines to show (default 15)"}}), &[])},
         {"name": "summary", "description": "Counts per verdict, both apps' versions, sign-in problems, route changes, test generation totals, and the routes where the new app fails.",
          "inputSchema": schema(json!({"pair": pair}), &["pair"])},
-        {"name": "results", "description": "Compared routes, worst first, filtered by verdict (new-broken, status, effects, body, minor, new-fixed, both-fail, same) and/or text in 'METHOD uri' or the notes.",
+        {"name": "results", "description": "Compared routes, worst first, filtered by verdict (new-broken, status, effects, body, minor, new-fixed, rejected, both-fail, same) and/or text in 'METHOD uri' or the notes.",
          "inputSchema": schema(json!({"pair": pair, "verdict": {"type": "string"}, "contains": {"type": "string"},
              "limit": {"type": "integer", "description": "Default 30"}, "offset": {"type": "integer"}}), &["pair"])},
         {"name": "show", "description": "One route in full: the request sent, the old and the new answer (status, JSON, exception, log lines, side effects) and the differences. Give 'METHOD uri' or a unique part of it.",
@@ -94,7 +94,11 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
         {"name": "channels_check", "description": "Broadcasting after the upgrade (Laravel Echo with Pusher/Redis -> Reverb): asks both apps who may join each private and presence channel (routes/channels.php, the way /broadcasting/auth does) for the signed-in users, using the channel names the requests broadcast on during run; whether /broadcasting/auth still exists and its middleware; the broadcast driver and missing Reverb settings. Run after run. Results go into fix_list (area Broadcasting). Background job.",
          "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
-        {"name": "import_log", "description": "Add real requests from a web server access log (nginx/Apache combined, a file path on this machine) as extra cases log-<n>: successful GETs matched to planned routes, with the ids, filters, sorting and paging real users sent (query values that look like secrets are dropped). Then run (or rerun the routes) to compare them.",
+        {"name": "learn", "description": "For requests that should pass but the old app refused with validation errors (verdict rejected): fill the fields its errors name and send them to both apps again, a few rounds. run already does this ([run] learn); use it after changing requests by hand. Background job.",
+         "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
+        {"name": "recorder", "description": "Write a middleware (runs/<name>/ParityRecorder.php) that records real saves (POST/PUT/PATCH/DELETE answered 2xx, with bodies, secrets left out) on a test or staging copy of the OLD app, with install steps for the user. import_log then reads its parity-requests.jsonl as rec-<n> cases. Show the user the steps; never install it on production.",
+         "inputSchema": schema(json!({"pair": pair}), &["pair"])},
+        {"name": "import_log", "description": "Add real requests as extra cases: from a web server access log (nginx/Apache combined: successful GETs, as log-<n>, with the ids, filters, sorting and paging real users sent) or from the recorder's parity-requests.jsonl (real saves with bodies, as rec-<n>). Values that look like secrets are dropped. A file path on this machine. Then run (or rerun the routes) to compare them.",
          "inputSchema": schema(json!({"pair": pair, "log": {"type": "string", "description": "Path of the access log"},
              "per_route": {"type": "integer", "description": "At most this many different requests per route (default 5)"}}), &["pair", "log"])},
         {"name": "overview", "description": "Every pair file at once: last run, how many routes answer the same, fix items per priority, the change since the previous run, and the next step; closest to release first. For a team upgrading many apps.",
@@ -811,6 +815,12 @@ fn call(name: &str, args: &Value) -> Res<String> {
                 v["summary"].as_str().unwrap_or_default()
             ))
         }),
+        "learn" => start("learn", args, |c| {
+            let line = crate::learn::improve(&c, None)?;
+            crate::ops::report(&c)?;
+            Ok(format!("{line}. The fix list is updated."))
+        }),
+        "recorder" => crate::logs::recorder(&load(args)?),
         "import_log" => crate::logs::import(
             &load(args)?,
             &config::expand(args["log"].as_str().ok_or("log is required")?),

@@ -10,7 +10,7 @@ use crate::glob;
 use crate::plan::Spec;
 
 /// Worst first; the report is sorted by this.
-pub const VERDICTS: [(&str, &str); 8] = [
+pub const VERDICTS: [(&str, &str); 9] = [
     (
         "new-broken",
         "New app fails (5xx or crash) where the old one answered",
@@ -23,6 +23,10 @@ pub const VERDICTS: [(&str, &str); 8] = [
     ("body", "Different response body"),
     ("minor", "Only types (\"1\" vs 1) or list order differ"),
     ("new-fixed", "Old app failed, new app answers"),
+    (
+        "rejected",
+        "Both apps refuse the request's input (validation errors): the save itself was not checked",
+    ),
     ("both-fail", "Both apps fail"),
     ("same", "Same"),
 ];
@@ -111,8 +115,51 @@ pub fn mask(row: &Value, texts: &[String]) -> Value {
     serde_json::from_str(&dumped).unwrap_or_else(|_| row.clone())
 }
 
+/// The fields a validation answer names (`{"errors": {"name": ["The name field is required."]}}`), also when the app
+/// sends it with status 500 instead of 422; None when the answer is not a validation refusal.
+pub fn rejected(row: &Value) -> Option<Vec<String>> {
+    if row["status"].as_i64().is_none_or(|s| s < 400) {
+        return None;
+    }
+    // `'errors' => ['general' => $e->getMessage()]` is a caught exception, not a field
+    let fields: Vec<String> = row["json"]["errors"]
+        .as_object()?
+        .keys()
+        .filter(|k| !["general", "message", "exception", "error"].contains(&k.as_str()))
+        .cloned()
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// The validation messages of a refusal, "field: message" each.
+pub fn rejections(row: &Value) -> Vec<String> {
+    let Some(fields) = rejected(row) else {
+        return vec![];
+    };
+    fields
+        .iter()
+        .map(|f| {
+            let said = &row["json"]["errors"][f];
+            let text = said
+                .as_array()
+                .and_then(|a| a.first())
+                .unwrap_or(said)
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| said.to_string());
+            format!("{f}: {text}")
+        })
+        .collect()
+}
+
+/// A crash or server error; a validation refusal is an answer even when its status is 500.
 fn failed(row: &Value) -> bool {
-    row["status"].as_i64().is_none_or(|s| s >= 500)
+    row["status"].as_i64().is_none_or(|s| s >= 500) && rejected(row).is_none()
+}
+
+/// Cases that should pass validation: when both apps refuse them, the save they stand for was never checked.
+fn should_pass(case: &str) -> bool {
+    case == "happy" || case.starts_with("log-") || case.starts_with("rec-")
 }
 
 /// Differences as (kind, path, old, new); kind is value, missing, added, type or order.
@@ -372,6 +419,10 @@ fn message(row: &Value) -> String {
         return e.to_string();
     }
     if let Some(m) = row["json"]["message"].as_str().filter(|m| !m.is_empty()) {
+        let said = rejections(row);
+        if !said.is_empty() {
+            return format!("{m} ({})", said.join("; "));
+        }
         return match row["json"]["exception"].as_str() {
             Some(e) => format!("{e}: {m}"),
             None => m.to_string(),
@@ -507,15 +558,40 @@ pub fn compare(spec: &Spec, old: Option<&Value>, new: Option<&Value>, rules: &Ru
 
     if old["kind"] == "json" && new["kind"] == "json" {
         let mut diffs = vec![];
-        compare_json(&old["json"], &new["json"], rules, "$", &mut diffs);
+        // validation refusals: which fields are refused is the behaviour; the wording is Laravel's (reworded in 10)
+        let (a, b, reworded) = match (rejected(old), rejected(new)) {
+            (Some(x), Some(y)) => {
+                let fields = |row: &Value, names: &[String]| {
+                    let mut json = row["json"].clone();
+                    json["errors"] = json!(
+                        names
+                            .iter()
+                            .map(|n| (n.clone(), json!(true)))
+                            .collect::<serde_json::Map<_, _>>()
+                    );
+                    json
+                };
+                let reworded = old["json"]["errors"] != new["json"]["errors"]
+                    && x.iter().all(|f| y.contains(f))
+                    && y.iter().all(|f| x.contains(f));
+                (fields(old, &x), fields(new, &y), reworded)
+            }
+            _ => (old["json"].clone(), new["json"].clone(), false),
+        };
+        compare_json(&a, &b, rules, "$", &mut diffs);
         let major = diffs.iter().any(|d| d.0 != "type" && d.0 != "order");
         verdicts.push(if major {
             "body"
-        } else if diffs.is_empty() {
+        } else if diffs.is_empty() && !reworded {
             "same"
         } else {
             "minor"
         });
+        if reworded {
+            outcome.notes.push(
+                "same fields refused; only the validation messages are worded differently".into(),
+            );
+        }
         for (kind, path, x, y) in diffs.iter().take(12) {
             outcome.notes.push(describe(kind, path, x, y));
         }
@@ -556,6 +632,16 @@ pub fn compare(spec: &Spec, old: Option<&Value>, new: Option<&Value>, rules: &Ru
         .min_by_key(|v| rank(v))
         .unwrap_or("same")
         .to_string();
+    if (outcome.verdict == "same" || outcome.verdict == "minor")
+        && should_pass(&spec.case)
+        && rejected(old).is_some()
+        && rejected(new).is_some()
+    {
+        outcome.verdict = "rejected".into();
+        outcome
+            .notes
+            .insert(0, format!("both apps refuse the input: {}", message(old)));
+    }
     outcome
 }
 
@@ -581,5 +667,42 @@ mod tests {
         );
         let kinds: Vec<&str> = out.iter().map(|d| d.0.as_str()).collect();
         assert_eq!(kinds, vec!["type", "order"]);
+    }
+
+    #[test]
+    fn validation_refusals_are_answers() {
+        let rules = Rules {
+            ignore: &[],
+            unordered: true,
+            not_compared: &[],
+        };
+        let refusal = json!({"status": 500, "kind": "json",
+            "json": {"message": "Error Saving Record.", "errors": {"name": ["The name field is required."]}}});
+        let crash = json!({"status": 500, "kind": "json", "json": {"message": "Server Error", "errors": {"general": "x"}}});
+        assert_eq!(rejected(&refusal), Some(vec!["name".to_string()]));
+        assert_eq!(rejected(&crash), None);
+        let mut spec = Spec {
+            case: "happy".into(),
+            ..Default::default()
+        };
+        let outcome = compare(&spec, Some(&refusal), Some(&refusal), &rules);
+        assert_eq!(outcome.verdict, "rejected");
+        assert!(outcome.notes[0].contains("name: The name field is required."));
+        spec.case = "empty".into();
+        assert_eq!(
+            compare(&spec, Some(&refusal), Some(&refusal), &rules).verdict,
+            "same"
+        );
+        assert_eq!(
+            compare(&spec, Some(&crash), Some(&crash), &rules).verdict,
+            "both-fail"
+        );
+        // the new app asks for another field: a validation change
+        let other = json!({"status": 500, "kind": "json",
+            "json": {"message": "Error Saving Record.", "errors": {"title": ["The title field is required."]}}});
+        assert_eq!(
+            compare(&spec, Some(&refusal), Some(&other), &rules).verdict,
+            "body"
+        );
     }
 }

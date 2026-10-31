@@ -61,6 +61,32 @@ pub struct Spec {
     /// A case someone added (the AI through `add_case`, or a person in requests.json): kept by every new plan.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom: bool,
+    /// The body the tool made (from the rules, the web app's calls and what it learned): a body that differs from it
+    /// was typed by a person, and a new plan keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made: Option<Value>,
+    /// "field: message" for each field filled because the old app's validation errors asked for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned: Vec<String>,
+}
+
+/// Whether a person typed this request's body (a new plan keeps it) rather than the tool making it.
+pub fn person_typed(spec: &Spec) -> bool {
+    let Some(body) = spec.body.as_ref().filter(|b| *b != &json!({})) else {
+        return false;
+    };
+    match &spec.made {
+        Some(made) => made != body,
+        // requests.json from before `made` was kept: the tool's bodies carry its note, its validation cases a field
+        None => {
+            !(spec.case.starts_with("without-")
+                || spec
+                    .note
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.starts_with("body made from")))
+        }
+    }
 }
 
 fn happy() -> String {
@@ -578,6 +604,7 @@ pub fn build(
         let typed = kept.get(&(key.as_str(), "happy"));
         if let Some(old) = typed {
             spec.body = old.body.clone().or(spec.body);
+            spec.made = old.made.clone();
             spec.query = old.query.clone();
             spec.headers = old.headers.clone();
             spec.values = old.values.clone();
@@ -649,7 +676,7 @@ pub fn build(
         } else {
             None
         };
-        let typed_body = typed.is_some_and(|t| t.body.as_ref().is_some_and(|b| b != &json!({})));
+        let typed_body = typed.is_some_and(|t| person_typed(t));
         let sent = web_sends.get(key.as_str());
         if method != "GET" && !typed_body && (rules.is_some() || sent.is_some()) {
             let fields = rules.clone().unwrap_or_default();
@@ -694,7 +721,16 @@ pub fn build(
             spec.note = spec
                 .note
                 .clone()
+                .filter(|n| !n.as_str().is_some_and(|n| n.starts_with("body made from")))
                 .or(Some(json!(format!("body made from {from}"))));
+        }
+        // fields earlier runs learned from the old app's validation errors stay
+        if !typed_body && let Some(old) = typed {
+            crate::learn::carry(old, &mut spec.body, &mut spec.query);
+            spec.learned = old.learned.clone();
+        }
+        if !typed_body && method != "GET" {
+            spec.made = spec.body.clone();
         }
 
         let mut cases = vec![];
@@ -741,6 +777,7 @@ pub fn build(
                     let mut less = body.clone();
                     less.remove(&field.name);
                     case.body = Some(Value::Object(less));
+                    case.made = case.body.clone();
                     case.without = vec![field.name.clone()];
                     cases.push(case);
                 }
@@ -749,8 +786,9 @@ pub fn build(
         for mut case in cases {
             // what a person typed for this case in requests.json wins
             if let Some(old) = kept.get(&(key.as_str(), case.case.as_str())) {
-                if old.body.is_some() && old.body != Some(json!({})) {
+                if person_typed(old) {
                     case.body = old.body.clone();
+                    case.made = old.made.clone();
                 }
                 case.query = old.query.clone().or(case.query);
                 case.headers = old.headers.clone().or(case.headers);
@@ -796,6 +834,7 @@ pub fn variant(spec: &Spec, case: &str) -> Spec {
     copy.skip = None;
     copy.note = None;
     copy.without = vec![];
+    copy.learned = vec![];
     copy
 }
 

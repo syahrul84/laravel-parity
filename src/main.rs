@@ -13,6 +13,7 @@ mod glob;
 mod guide;
 mod history;
 mod init;
+mod learn;
 mod log;
 mod logs;
 mod mcp;
@@ -101,7 +102,15 @@ enum Command {
     Console { pair: PathBuf },
     /// Who may join each broadcast channel (Echo / Reverb), the /broadcasting/auth route and the driver
     Channels { pair: PathBuf },
-    /// Add real requests from a web server access log as extra cases (successful GETs; secrets dropped)
+    /// Fill the fields the old app's validation errors name and send those requests again (run does this itself)
+    Learn {
+        pair: PathBuf,
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+    /// Write a middleware that records real saves on the old app (test or staging), for import-log
+    Recorder { pair: PathBuf },
+    /// Add real requests as extra cases: an access log (successful GETs) or the recorder's file (saves); secrets dropped
     ImportLog {
         pair: PathBuf,
         log: PathBuf,
@@ -227,6 +236,16 @@ fn main() {
             log,
             per_route,
         } => logs::import(&load(&pair), &log, per_route).map(drop),
+        Command::Learn { pair, workers } => {
+            let config = load(&pair);
+            learn::improve(&config, workers)
+                .and_then(|line| {
+                    say(&line);
+                    ops::report(&config)
+                })
+                .map(drop)
+        }
+        Command::Recorder { pair } => logs::recorder(&load(&pair)).map(drop),
         Command::Overview => history::overview().map(drop),
         Command::Baseline { pair, file } => {
             gate::baseline(&load(&pair), file.as_deref()).map(|line| say(&line))

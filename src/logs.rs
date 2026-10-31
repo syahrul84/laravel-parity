@@ -1,6 +1,8 @@
 //! Real requests from a web server's access log (nginx / Apache "combined", or any line with `"GET /path HTTP/1.1"
 //! 200`) as extra cases: the ids, filters, sorting and paging real users sent, instead of values the tool made up.
 //! Only successful GETs (an access log has no request bodies); query values that look like secrets are dropped.
+//! The recorder (`laravel-parity recorder`, a middleware for the old app on a test or staging server) writes real saves
+//! with their bodies as JSON lines; the same import reads them as `rec-<n>` cases.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -93,7 +95,14 @@ pub fn import(config: &Config, file: &Path, per_route: usize) -> Res<String> {
     let path = config.work.join("requests.json");
     let mut specs: Vec<Spec> = read(&path).ok_or("no plan yet: run plan first")?;
     let text = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let text = String::from_utf8_lossy(&text);
+    let line = add_from(&mut specs, &String::from_utf8_lossy(&text), per_route);
+    write(&path, &specs)?;
+    say(&line);
+    Ok(line)
+}
+
+/// The cases a log or recorder file adds to the plan; returns the summary line.
+fn add_from(specs: &mut Vec<Spec>, text: &str, per_route: usize) -> String {
     // GET routes, most specific template first (api/units/export before api/units/{unit})
     let mut routes: Vec<(&Spec, Regex)> = specs
         .iter()
@@ -114,7 +123,75 @@ pub fn import(config: &Config, file: &Path, per_route: usize) -> Res<String> {
     let mut seen: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut added: Vec<Spec> = vec![];
     let (mut lines, mut matched) = (0, 0);
+    let all_routes: HashMap<&str, &Spec> = specs
+        .iter()
+        .filter(|s| s.case == "happy")
+        .map(|s| (s.key.as_str(), s))
+        .collect();
     for line in text.lines() {
+        // a line the recorder wrote: {"method", "route", "values", "query", "body", "status"}
+        if line.trim_start().starts_with('{') {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            lines += 1;
+            let key = format!(
+                "{} {}",
+                entry["method"].as_str().unwrap_or_default(),
+                entry["route"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_start_matches('/')
+            );
+            let Some(happy) = all_routes.get(key.as_str()).copied() else {
+                continue;
+            };
+            matched += 1;
+            let clean = |v: &Value| -> Map<String, Value> {
+                v.as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, _)| !SECRET.is_match(k))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let query = clean(&entry["query"]);
+            let body = clean(&entry["body"]);
+            let values: BTreeMap<String, String> = entry["values"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                v.as_str()
+                                    .map(String::from)
+                                    .unwrap_or_else(|| v.to_string()),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let signature = format!("{values:?}{query:?}{body:?}");
+            let known = seen.entry(happy.key.clone()).or_default();
+            if known.len() >= per_route || !known.insert(signature.clone()) {
+                continue;
+            }
+            let case_name = format!("rec-{}", &request_id(&signature)[..6]);
+            if existing.contains(&(happy.key.clone(), case_name.clone())) {
+                continue;
+            }
+            let mut case = variant(happy, &case_name);
+            case.custom = true;
+            case.note = Some(json!("recorded on the old app"));
+            case.query = (!query.is_empty()).then_some(query);
+            case.body = (happy.method != "GET").then_some(Value::Object(body));
+            case.made = None;
+            add_case(&mut added, case, &values);
+            continue;
+        }
         let Some(cap) = LINE.captures(line) else {
             continue;
         };
@@ -173,19 +250,7 @@ pub fn import(config: &Config, file: &Path, per_route: usize) -> Res<String> {
         case.custom = true;
         case.note = Some(json!("from the access log"));
         case.query = (!query.is_empty()).then_some(query);
-        for (k, v) in &values {
-            case.values.insert(k.clone(), v.clone());
-            case.filled.insert(k.clone(), v.clone());
-        }
-        let filled = case.filled.clone();
-        let uri = PARAM.replace_all(&case.template, |c: &regex::Captures| {
-            filled.get(&c[1]).cloned().unwrap_or_default()
-        });
-        case.uri = SLASHES
-            .replace_all(&uri, "/")
-            .trim_end_matches('/')
-            .to_string();
-        added.push(case);
+        add_case(&mut added, case, &values);
     }
     let routes_hit = added
         .iter()
@@ -197,10 +262,49 @@ pub fn import(config: &Config, file: &Path, per_route: usize) -> Res<String> {
     specs.sort_by(|a, b| {
         (&a.key, a.case != "happy", &a.case).cmp(&(&b.key, b.case != "happy", &b.case))
     });
-    write(&path, &specs)?;
+    format!(
+        "{lines} requests in the file, {matched} on planned routes (successful GETs from an access log, saves from the \
+         recorder); added {count} cases on {routes_hit} routes (at most {per_route} per route). Next: run (or rerun a \
+         route) to send them to both apps."
+    )
+}
+
+/// The route's parameters as the real request had them, then the case joins the others.
+fn add_case(added: &mut Vec<Spec>, mut case: Spec, values: &BTreeMap<String, String>) {
+    for (k, v) in values {
+        case.values.insert(k.clone(), v.clone());
+        case.filled.insert(k.clone(), v.clone());
+    }
+    let filled = case.filled.clone();
+    let uri = PARAM.replace_all(&case.template, |c: &regex::Captures| {
+        filled.get(&c[1]).cloned().unwrap_or_default()
+    });
+    case.uri = SLASHES
+        .replace_all(&uri, "/")
+        .trim_end_matches('/')
+        .to_string();
+    added.push(case);
+}
+
+/// The middleware that records real saves on the old app, written to `runs/<name>/ParityRecorder.php`.
+pub fn recorder(config: &Config) -> Res<String> {
+    let path = config.work.join("ParityRecorder.php");
+    std::fs::create_dir_all(&config.work).map_err(|e| e.to_string())?;
+    std::fs::write(&path, include_str!("../php/ParityRecorder.php")).map_err(|e| e.to_string())?;
     let line = format!(
-        "{lines} requests in the log, {matched} successful GETs on planned routes; added {count} cases on {routes_hit} routes \
-         (at most {per_route} per route). Next: run (or rerun a route) to send them to both apps."
+        "Wrote {}.\n\
+         It records the saves (POST, PUT, PATCH, DELETE answered 2xx) a real user makes, with their bodies, so the tool can\n\
+         send the same saves to both apps. Secret-looking values and uploaded files are left out.\n\n\
+         1. Use a TEST or STAGING copy of the OLD app, not production. Copy the file to app/Http/Middleware/.\n\
+         2. Register it for the API routes:\n\
+         \x20  Laravel 5.5 to 10: in app/Http/Kernel.php add \\App\\Http\\Middleware\\ParityRecorder::class to\n\
+         \x20  $middlewareGroups['api'] (and 'web' if the app saves through web routes).\n\
+         \x20  Laravel 11 and later: in bootstrap/app.php, ->withMiddleware(function ($middleware) {{\n\
+         \x20  $middleware->api(append: [\\App\\Http\\Middleware\\ParityRecorder::class]); }})\n\
+         3. Use the app (or let testers use it) for a while. Saves land in storage/logs/parity-requests.jsonl.\n\
+         4. Copy that file here and run: laravel-parity import-log <pair file> parity-requests.jsonl\n\
+         5. Remove the middleware.",
+        path.display()
     );
     say(&line);
     Ok(line)
@@ -223,5 +327,26 @@ mod tests {
         assert!(!q.contains_key("api_token") && !q.contains_key("access_token"));
         let line = r#"1.2.3.4 - - [31/Oct/2026:10:00:00 +0800] "GET /api/units/5?page=3 HTTP/1.1" 200 512 "-" "x""#;
         assert!(LINE.is_match(line));
+    }
+
+    #[test]
+    fn recorded_saves() {
+        let happy = Spec {
+            id: "a".into(),
+            key: "PUT api/units/{unit}".into(),
+            case: "happy".into(),
+            method: "PUT".into(),
+            template: "api/units/{unit}".into(),
+            uri: "api/units/1".into(),
+            body: Some(json!({"name": "parity name"})),
+            ..Default::default()
+        };
+        let mut specs = vec![happy];
+        let line = r#"{"method":"PUT","route":"api/units/{unit}","values":{"unit":"7"},"query":{},"body":{"name":"Block A","api_token":"x"},"status":200}"#;
+        add_from(&mut specs, &format!("{line}\n{line}\n"), 5);
+        assert_eq!(specs.len(), 2);
+        let rec = specs.iter().find(|s| s.case.starts_with("rec-")).unwrap();
+        assert_eq!(rec.uri, "api/units/7");
+        assert_eq!(rec.body, Some(json!({"name": "Block A"})));
     }
 }

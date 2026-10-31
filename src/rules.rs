@@ -186,11 +186,22 @@ fn body(lookup: &mut CodeLookup, symbol: &Value) -> Option<(String, String)> {
     Some((lines.join("\n"), source))
 }
 
-/// The rules for a controller action, or None when none could be read.
+/// Fields from several places, merged: the first rule set that names a field wins.
+fn merge(into: &mut Vec<Field>, more: Vec<Field>) {
+    for field in more {
+        if !into.iter().any(|f| f.name == field.name) {
+            into.push(field);
+        }
+    }
+}
+
+/// The rules for a controller action, or None when none could be read. A method often validates in several places
+/// (a scope check for project_id, then the record's own rules in a helper), so every one is read and merged.
 pub fn for_action(lookup: &mut CodeLookup, action: Option<&str>) -> Option<Vec<Field>> {
     let (class, method) = action?.split_once('@')?;
     let symbol = lookup.symbol(&format!("{class}::{method}"))?;
     let (method_body, source) = body(lookup, &symbol)?;
+    let mut fields = vec![];
 
     // a FormRequest argument: its rules()
     if let Some(params) = symbol["meta"]["params"].as_array() {
@@ -211,72 +222,112 @@ pub fn for_action(lookup: &mut CodeLookup, action: Option<&str>) -> Option<Vec<F
                     .or_else(|| text.find('['))
                     .unwrap_or(0);
                 if let Some(inner) = bracket(&text, at) {
-                    let fields = parse_array(&inner);
-                    if !fields.is_empty() {
-                        return Some(fields);
-                    }
+                    merge(&mut fields, parse_array(&inner));
                 }
             }
         }
     }
 
-    // $request->validate([...]) / Validator::make($data, [...]) in the method
-    if let Some(fields) = inline_rules(&method_body) {
-        return Some(fields);
-    }
+    // $request->validate([...]) / Validator::make($data, [...]) / $this->getValidatorAction($request, [...])
+    merge(&mut fields, inline_rules(&method_body));
 
-    // ... or in a helper of the same controller it calls: $this->getValidator($request), $this->rules()
+    // ... and in helpers of the same controller it calls: $this->getValidator($request), $this->rules()
     static HELPER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$this->(\w+)\(").unwrap());
-    let helpers: Vec<String> = HELPER
-        .captures_iter(&method_body)
-        .map(|c| c[1].to_string())
-        .collect();
-    for helper in helpers.iter().take(5) {
+    let mut helpers: Vec<String> = vec![];
+    for c in HELPER.captures_iter(&method_body) {
+        if !helpers.contains(&c[1].to_string()) {
+            helpers.push(c[1].to_string());
+        }
+    }
+    for helper in helpers.iter().take(8) {
         let Some(symbol) = lookup.symbol(&format!("{class}::{helper}")) else {
             continue;
         };
         let Some((text, _)) = body(lookup, &symbol) else {
             continue;
         };
-        if let Some(fields) = inline_rules(&text) {
-            return Some(fields);
-        }
-        // a rules() helper that only returns the array
-        if helper.contains("rule")
+        let found = inline_rules(&text);
+        if !found.is_empty() {
+            merge(&mut fields, found);
+        } else if helper.to_lowercase().contains("rule")
             && let Some(inner) = text.rfind("return [").and_then(|at| bracket(&text, at))
         {
-            let fields = parse_array(&inner);
-            if !fields.is_empty() {
-                return Some(fields);
+            // a rules() helper that only returns the array
+            merge(&mut fields, parse_array(&inner));
+        }
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// The rules of every `->validate([...])`, `Validator::make($data, [...])` and `$this->...Validat...(..., [...])` in
+/// a piece of code, merged.
+fn inline_rules(code: &str) -> Vec<Field> {
+    static INLINE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(->validate\(|Validator::make\(|\$this->\w*[vV]alidat\w*\()").unwrap()
+    });
+    static VARIABLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*(\$\w+)\s*(,|$)").unwrap());
+    let mut fields = vec![];
+    for found in INLINE.find_iter(code) {
+        let after = &code[found.end()..];
+        // the call's own arguments only
+        let Some(args) = call_arguments(after) else {
+            continue;
+        };
+        let at = if found.as_str().starts_with("->validate") {
+            0
+        } else {
+            // skip the first argument (the data, or the request)
+            match args.find(',') {
+                Some(i) => i + 1,
+                None => continue,
             }
+        };
+        // the rules passed by name ($rules): the array assigned to it before the call
+        if let Some(var) = VARIABLE.captures(&args[at..]) {
+            let Ok(assign) = Regex::new(&format!(r"{}\s*=\s*\[", regex::escape(&var[1]))) else {
+                continue;
+            };
+            if let Some(start) = assign.find_iter(&code[..found.start()]).last()
+                && let Some(inner) = bracket(code, start.start())
+            {
+                merge(&mut fields, parse_array(&inner));
+            }
+            continue;
+        }
+        if args[at..].trim_start().starts_with('[')
+            && let Some(inner) = bracket(&args, at)
+        {
+            merge(&mut fields, parse_array(&inner));
+        }
+    }
+    fields
+}
+
+/// The text between a call's parentheses, given the code right after its `(`.
+fn call_arguments(after: &str) -> Option<String> {
+    let (mut depth, mut quote) = (1i32, None::<char>);
+    for (i, c) in after.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '[' => depth += 1,
+            ']' => depth -= 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after[..i].to_string());
+                }
+            }
+            _ => {}
         }
     }
     None
-}
-
-/// The rules of the first `->validate([...])` / `Validator::make($data, [...])` in a piece of code.
-fn inline_rules(code: &str) -> Option<Vec<Field>> {
-    static INLINE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(->validate\(|Validator::make\()").unwrap());
-    static VARIABLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\$\w+)\s*[,)]").unwrap());
-    let found = INLINE.find(code)?;
-    let after = &code[found.end()..];
-    let at = if found.as_str().starts_with("Validator") {
-        // skip the first argument (the data)
-        found.end() + after.find(',')? + 1
-    } else {
-        found.end()
-    };
-    // the rules passed by name ($rules): the array assigned to it before the call
-    if let Some(var) = VARIABLE.captures(&code[at..]) {
-        let assign = Regex::new(&format!(r"{}\s*=\s*\[", regex::escape(&var[1]))).ok()?;
-        let start = assign.find_iter(&code[..found.start()]).last()?.start();
-        let fields = parse_array(&bracket(code, start)?);
-        return (!fields.is_empty()).then_some(fields);
-    }
-    let inner = bracket(code, at)?;
-    let fields = parse_array(&inner);
-    (!fields.is_empty()).then_some(fields)
 }
 
 /// A value that passes the field's rules. `exists` asks the test data through `pick`.
@@ -364,15 +415,20 @@ mod tests {
     #[test]
     fn rules_in_a_variable() {
         let code = "$rules = ['name' => 'required|max:5', 'qty' => 'integer'];\n$v = \\Validator::make($request->all(), $rules);";
-        let names: Vec<String> = inline_rules(code)
-            .unwrap()
-            .into_iter()
-            .map(|f| f.name)
-            .collect();
+        let names: Vec<String> = inline_rules(code).into_iter().map(|f| f.name).collect();
         assert_eq!(names, ["name", "qty"]);
         assert!(
-            inline_rules("$rules = [];\n$v = Validator::make($request->all(), $rules);").is_none()
+            inline_rules("$rules = [];\n$v = Validator::make($request->all(), $rules);").is_empty()
         );
+    }
+
+    #[test]
+    fn every_validation_in_a_method() {
+        let code = "$this->validateScope();\nrequest()->validate(['project_id' => 'required']);\n\
+                    $v = $this->getValidatorAction(request(), ['status_delete_message' => 'required']);\n\
+                    $w = \\Validator::make($request->all(), ['project_id' => 'integer', 'date' => 'required|date']);";
+        let names: Vec<String> = inline_rules(code).into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["project_id", "status_delete_message", "date"]);
     }
 
     #[test]

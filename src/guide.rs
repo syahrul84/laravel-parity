@@ -44,7 +44,10 @@ what differs, worst first. It can also write PHPUnit tests for routes that have 
    body        a different answer (new fields are usually fine; missing ones are not)
    minor       only "1" vs 1 or list order
    new-fixed   the old app failed, the new one works
-   both-fail   both fail: usually the request needs a real body or more data (see below)
+   rejected    both apps refuse the input with validation errors, so the save was not checked; the tool already
+               filled the fields the old app asked for and sent it again ([run] learn rounds); the note says
+               what is still wanted
+   both-fail   both crash the same way: a bug the old code had, or test data the route needs (see below)
 
 6. After fixing a route, run just that part again; it replaces only those results:
      laravel-parity run pairs/<name>.toml --only "api/admin/leases"
@@ -59,6 +62,9 @@ with runs/<name>/junit.xml and a GitHub job summary.
 Making it more realistic
   - Real requests: `laravel-parity import-log pairs/<name>.toml access.log` adds what users really sent
     (successful GETs from an nginx / Apache log) as extra cases.
+  - Real saves: `laravel-parity recorder pairs/<name>.toml` writes a middleware for the OLD app on a test
+    or staging server; it records the bodies of successful saves (secrets left out), and import-log reads
+    its file to add them as cases.
   - The inputs the web app sends with every call (user_id, project_id ...): [run] query / body.
   - Commands that need arguments, jobs that need ids: [console] commands / jobs in the pair file.
   - A real body for a save: the "body" of that request in runs/<name>/requests.json.
@@ -83,4 +89,4 @@ Workflow:
 6. generate_tests writes PHPUnit tests for untested routes into the new repo (tests/Feature/Parity) and runs them; test_results lists the failing ones and the routes that could not get a test.
 7. Then widen the coverage: test_gaps lists routes with few tested scenarios, with the controller's file:line, the cases already sent and the validation rules. Read the controller and add the scenarios worth checking with add_case (boundary values, each in: value, filters and paging the controller reads, wrong types, another project's id, unique-rule duplicates; "{param}" / "{user}" stand for that row's id / the signed-in user). rerun the route so both apps answer them (the old app's answer is the expected one), then generate_tests again. For a scenario that needs special setup (a factory state, a relation), write a test yourself in tests/Feature/Parity/Extra/ (the tool never touches that folder).
 
-both-fail on POST/PUT usually means the request body is empty: add a body to that request in runs/<name>/requests.json, or defaults in the pair file's [run] body. Unfilled route parameters go in [params]. Do not edit generated test files that still carry the @generated marker; remove the marker first if you change one by hand."#;
+rejected means both apps refused the body with validation errors even after the tool filled the fields the old app named (the note lists what is still wanted): give a real body with set_request. both-fail means both crash the same way; on POST/PUT it can still mean the body is wrong: add a body to that request in runs/<name>/requests.json, or defaults in the pair file's [run] body. Unfilled route parameters go in [params]. Do not edit generated test files that still carry the @generated marker; remove the marker first if you change one by hand."#;

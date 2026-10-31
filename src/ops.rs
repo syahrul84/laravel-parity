@@ -394,9 +394,41 @@ pub fn run(
             None => "nothing to run".into(),
         });
     }
+    let line = send(
+        config,
+        run,
+        skipped.len(),
+        only.is_some(),
+        resume,
+        !resume,
+        workers,
+    )?;
+    if config.learn == 0 {
+        return Ok(line);
+    }
+    // requests the old app refused for missing fields: fill what it named and send them again
+    let learned = crate::learn::improve(config, workers)?;
+    if learned.starts_with("nothing") {
+        return Ok(line);
+    }
+    say(&learned);
+    report(config)
+}
+
+/// Send the given requests to both apps and write the report. `partial` keeps the other results (a rerun), `resume`
+/// finishes a run that stopped, `keep` saves the current results first for "since the last run".
+pub fn send(
+    config: &Config,
+    run: Vec<Spec>,
+    skipped: usize,
+    partial: bool,
+    resume: bool,
+    keep: bool,
+    workers: Option<usize>,
+) -> Res<String> {
     let meta_file = config.work.join("run.json");
-    let partial = only.is_some() || resume;
-    if !resume {
+    let partial = partial || resume;
+    if keep {
         // "since the last run" compares with these
         crate::history::keep_previous(config);
     }
@@ -420,14 +452,13 @@ pub fn run(
         .min(run.len().div_ceil(config.batch))
         .max(1);
     say(&format!(
-        "Running {} requests on both apps, {workers} PHP processes each (clock fixed at {clock}); {} not run.",
-        run.len(),
-        skipped.len()
+        "Running {} requests on both apps, {workers} PHP processes each (clock fixed at {clock}); {skipped} not run.",
+        run.len()
     ));
     for side in [&config.old, &config.new] {
         runner::ensure_ready(side)?;
         let out = config.work.join(format!("results-{}.jsonl", side.label));
-        if only.is_some() {
+        if partial && !resume {
             let ids: HashSet<&str> = run.iter().map(|s| s.id.as_str()).collect();
             forget(&out, &ids)?;
         } else if !resume {

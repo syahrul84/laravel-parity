@@ -54,6 +54,8 @@ pub struct Config {
     pub cases: Vec<String>,
     /// The id the `missing` case puts in place of real ones.
     pub missing_id: String,
+    /// rounds of filling the fields the old app's validation errors name, then sending again (0 = off)
+    pub learn: usize,
     pub ignore_keys: Vec<String>,
     pub unordered_lists: bool,
     pub masks: Vec<String>,
@@ -158,6 +160,7 @@ struct RawRun {
     allow_hosts: Vec<String>,
     cases: Option<Vec<String>>,
     missing_id: Option<String>,
+    learn: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]
@@ -373,6 +376,7 @@ pub fn load(path: &Path) -> Result<Config, String> {
                 .to_vec()
         }),
         missing_id: raw.run.missing_id.unwrap_or_else(|| "999999999".into()),
+        learn: raw.run.learn.unwrap_or(4),
         ignore_keys: raw.compare.ignore_keys.unwrap_or_else(|| {
             [
                 "created_at",

@@ -53,6 +53,9 @@ workers = 4                 # PHP processes per app; both apps run at the same t
 # Each route is sent several ways: happy (signed in, a real id, a body that passes validation), guest (not signed
 # in), missing (an id that does not exist), validation (empty body, each required field left out).
 cases = ["happy", "guest", "missing", "validation"]
+# When the old app refuses a made-up body with validation errors ("The name field is required."), the tool fills the
+# fields those errors name and sends the request again, up to this many rounds (0 turns it off)
+learn = 4
 # what the web app sends with almost every call; a request's own query/body wins
 query = {}
 body = {}

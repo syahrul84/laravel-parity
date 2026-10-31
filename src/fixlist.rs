@@ -632,9 +632,36 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
             area: "Not checked".into(),
             title: format!("{both_fail} routes fail on both apps, so the upgrade could not be judged for them"),
             location: None,
-            hint: Some("Usually the request needs a real body or more data: set it with the MCP tool set_request or in requests.json, then rerun.".into()),
+            hint: Some("Each one's error is in report.md (the same crash on both apps: a bug the old code already had, or test data the route needs). Set a body or values with the MCP tool set_request or in requests.json, then rerun.".into()),
             routes: vec![],
             details: vec![],
+        });
+    }
+    // saves both apps refused even after learning from the old app's validation errors: what each still wants
+    let refused: Vec<String> = results
+        .iter()
+        .filter(|r| r.verdict == "rejected" && r.case == "happy")
+        .map(|r| {
+            let said = r
+                .notes
+                .first()
+                .map(|n| n.trim_start_matches("both apps refuse the input: "))
+                .unwrap_or_default();
+            format!("{}: {said}", r.key)
+        })
+        .collect();
+    if !refused.is_empty() {
+        add(Fix {
+            priority: 4,
+            area: "Not checked".into(),
+            title: format!(
+                "{} saves were refused by validation on both apps, so what they save was not compared",
+                refused.len()
+            ),
+            location: None,
+            hint: Some("Each line says what the old app still wants. Give a real body with set_request or in requests.json (or record real requests: `laravel-parity recorder`), then rerun.".into()),
+            routes: vec![],
+            details: refused,
         });
     }
 
