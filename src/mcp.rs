@@ -72,7 +72,7 @@ fn tools() -> Value {
              "expected": {"type": "string"}, "actual": {"type": "string"}, "pair": pair}), &["kind", "summary"])},
         {"name": "fix_list", "description": "What to fix after the upgrade, worst first: API crashes grouped by cause with the file:line in the new code and the likely cause, routes now open without sign-in or no longer reachable, validation that changed, web app calls the upgrade breaks (with the web file:line), lost response fields, side effects. Also written to runs/<name>/fixes.md for people.",
          "inputSchema": schema(json!({"pair": pair, "priority": {"type": "integer", "description": "Only this priority: 1 fix before release, 2 fix soon, 3 check, 4 know about"},
-             "area": {"type": "string", "description": "API, Access, Validation, UI, Response, Side effects, Not checked"}, "limit": {"type": "integer", "description": "Default 20"}}), &["pair"])},
+             "area": {"type": "string", "description": "API, Access, Validation, UI, Code, Database, Jobs & commands, Broadcasting, Response, Side effects, Speed, Not checked"}, "limit": {"type": "integer", "description": "Default 20"}}), &["pair"])},
         {"name": "code_check", "description": "Problems in the upgraded code found without running it: routes to controller methods that do not exist (codemap doctor, new vs already there), upgrade traps chosen by the version jump ($dates removed in Laravel 10, Carbon 3 signed diffIn*, removed helpers, PHP 8.x removals and deprecations) with file:line and the fix, files the new PHP cannot parse, and PHPStan when installed. Results go into fix_list (area Code). Background job.",
          "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
         {"name": "web_check", "description": "Read the web app (Vue 2, Vue 3, Nuxt, React; [web] in the pair file) with codemap twice: old web against the old API, shipping web against the new API. Returns the web calls the upgrade breaks (route gone, wrong method, required field not sent, response field gone) with their file:line. Background job.",
@@ -88,6 +88,17 @@ fn tools() -> Value {
              "query": {"type": "object"}, "values": {"type": "object", "description": "Route parameter -> value"},
              "signed_in": {"type": "boolean", "description": "Default: as the happy case"},
              "note": {"type": "string", "description": "What the scenario checks"}}), &["pair", "route", "name"])},
+        {"name": "schema_check", "description": "Compare the database itself, read from information_schema: (1) the old app's real database against its copy after the new app's migrations ran (what the release does to production: dropped tables or columns, narrowed types, lost unique keys and indexes, NOT NULL added); (2) the old database against an empty one built by the new app's migrations alone (what a new install, CI or a RefreshDatabase test gets; after moving from Propel or hand-made SQL to Laravel migrations this shows what they do not describe). Results go into fix_list (area Database). Background job.",
+         "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
+        {"name": "console_check", "description": "The app's own artisan commands, queued jobs (app/Jobs) and schedule on both apps: scheduled tasks missing or changed on the new app (Laravel 11 moved the schedule to routes/console.php), job classes gone (queued jobs fail after release), and every shared command and job RUN on both apps (rolled back, mail/queue/notifications/HTTP faked, time-limited) and compared: exit code, output, rows written, mail, jobs. Commands needing arguments and jobs needing ids take them from the pair file's [console]. Results go into fix_list (area Jobs & commands). Background job.",
+         "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
+        {"name": "channels_check", "description": "Broadcasting after the upgrade (Laravel Echo with Pusher/Redis -> Reverb): asks both apps who may join each private and presence channel (routes/channels.php, the way /broadcasting/auth does) for the signed-in users, using the channel names the requests broadcast on during run; whether /broadcasting/auth still exists and its middleware; the broadcast driver and missing Reverb settings. Run after run. Results go into fix_list (area Broadcasting). Background job.",
+         "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
+        {"name": "import_log", "description": "Add real requests from a web server access log (nginx/Apache combined, a file path on this machine) as extra cases log-<n>: successful GETs matched to planned routes, with the ids, filters, sorting and paging real users sent (query values that look like secrets are dropped). Then run (or rerun the routes) to compare them.",
+         "inputSchema": schema(json!({"pair": pair, "log": {"type": "string", "description": "Path of the access log"},
+             "per_route": {"type": "integer", "description": "At most this many different requests per route (default 5)"}}), &["pair", "log"])},
+        {"name": "overview", "description": "Every pair file at once: last run, how many routes answer the same, fix items per priority, the change since the previous run, and the next step; closest to release first. For a team upgrading many apps.",
+         "inputSchema": schema(json!({}), &[])},
         {"name": "test_results", "description": "Generated-test totals, the failing tests with their messages, and the routes that could not get a test and why.",
          "inputSchema": schema(json!({"pair": pair, "limit": {"type": "integer", "description": "Default 40 per list"}}), &["pair"])},
     ])
@@ -235,6 +246,11 @@ fn summary(config: &Config) -> Res<String> {
         "clock": meta["clock"],
         "routes": {"only_old": len(&diff["removed"]), "only_new": len(&diff["added"]), "changed": len(&diff["changed"])},
         "tests": read::<Value>(&config.work.join("tests.json")),
+        "since_last_run": read::<Value>(&config.work.join("changes.json")).map(|c| json!({
+            "fixed": c["fixed"].as_array().map_or(0, Vec::len), "newly_broken": c["broken"], "before": c["before"]})),
+        "database": crate::schema::last(config).map(|v| v["summary"].clone()),
+        "commands_and_jobs": crate::console::last(config).map(|v| v["summary"].clone()),
+        "channels": crate::channels::last(config).map(|v| v["summary"].clone()),
         "new_broken": broken,
         "report": config.work.join("report.md"),
         "next": "results with a verdict lists the rest; show gives one route in full",
@@ -778,6 +794,29 @@ fn call(name: &str, args: &Value) -> Res<String> {
                 "next": "show a route for its old and new answer; after a fix, rerun it"}),
             ))
         }
+        "schema_check" => start("schema_check", args, |c| {
+            crate::schema::check(&c).map(|v| v["summary"].as_str().unwrap_or_default().to_string())
+        }),
+        "console_check" => start("console_check", args, |c| {
+            let v = crate::console::check(&c)?;
+            Ok(format!(
+                "{} Details in fix_list (area Jobs & commands).",
+                v["summary"].as_str().unwrap_or_default()
+            ))
+        }),
+        "channels_check" => start("channels_check", args, |c| {
+            let v = crate::channels::check(&c)?;
+            Ok(format!(
+                "{} Details in fix_list (area Broadcasting).",
+                v["summary"].as_str().unwrap_or_default()
+            ))
+        }),
+        "import_log" => crate::logs::import(
+            &load(args)?,
+            &config::expand(args["log"].as_str().ok_or("log is required")?),
+            args["per_route"].as_u64().unwrap_or(5) as usize,
+        ),
+        "overview" => crate::history::overview(),
         "summary" => summary(&load(args)?),
         "results" => results(&load(args)?, args),
         "show" => show(&load(args)?, args),

@@ -26,6 +26,8 @@ if (empty($opts['app']) || empty($opts['job']) || empty($opts['out'])) {
 $appPath = rtrim($opts['app'], '/');
 $job = json_decode(file_get_contents($opts['job']), true);
 $out = fopen($opts['out'], 'w');
+// the tool stops a run that takes too long by this pid (a command that never ends)
+@file_put_contents(dirname($opts['out']).'/pid', (string) getmypid());
 
 chdir($appPath);
 require $appPath.'/vendor/autoload.php';
@@ -168,6 +170,9 @@ function parity_boot($appPath, array $job, $console, $request = null)
         $property->setValue($limiter, $app['cache']->store('array'));
     }
 
+    if (! isset($GLOBALS['parity_broadcast_default'])) {
+        $GLOBALS['parity_broadcast_default'] = (string) $config->get('broadcasting.default');
+    }
     $config->set('broadcasting.connections.parity', array('driver' => 'parity'));
     $config->set('broadcasting.default', 'parity');
     $app->make('Illuminate\Broadcasting\BroadcastManager')->extend('parity', function () {
@@ -204,6 +209,9 @@ function parity_capabilities()
         'http' => class_exists('Illuminate\Support\Facades\Http'),
         'logs' => class_exists('Illuminate\Log\Events\MessageLogged'),
         'rate_limiter' => parity_has('Illuminate\Cache\RateLimiter', 'cache', false),
+        'channels' => parity_has('Illuminate\Broadcasting\Broadcasters\Broadcaster', 'channels', false)
+            && parity_has('Illuminate\Broadcasting\Broadcasters\Broadcaster', 'verifyUserCanAccessChannel', true)
+            && parity_has('Illuminate\Broadcasting\BroadcastManager', 'drivers', false),
     );
 }
 
@@ -399,6 +407,75 @@ function parity_broadcast($job)
     );
 }
 
+/** What a request, a command or a job did besides answering, collected while it runs. */
+class ParityRecorder
+{
+    public static $writes = array();
+    public static $logs = array();
+    public static $queries = 0;
+}
+
+/** Fixed clock, fakes for everything that leaves the app, and listeners for writes and logged errors. */
+function parity_record($app, array $job)
+{
+    ParityBroadcaster::$sent = array();
+    ParityRecorder::$writes = array();
+    ParityRecorder::$logs = array();
+    ParityRecorder::$queries = 0;
+    if (! empty($job['clock'])) {
+        foreach (array('Illuminate\Support\Carbon', 'Carbon\Carbon', 'Carbon\CarbonImmutable') as $carbon) {
+            if (class_exists($carbon)) {
+                $carbon::setTestNow($carbon::parse($job['clock']));
+            }
+        }
+    }
+    // every disk goes to a throwaway folder: a DELETE must not remove real uploads, a POST must not leave files
+    foreach (array_keys((array) $app['config']->get('filesystems.disks')) as $disk) {
+        try {
+            Illuminate\Support\Facades\Storage::fake($disk);
+        } catch (Throwable $e) {
+        }
+    }
+    Illuminate\Support\Facades\Queue::fake();
+    Illuminate\Support\Facades\Mail::fake();
+    Illuminate\Support\Facades\Notification::fake();
+    if (class_exists('Illuminate\Support\Facades\Http')) {
+        Illuminate\Support\Facades\Http::fake();
+    }
+    $app['db']->listen(function ($query) {
+        ParityRecorder::$queries++;
+        if (preg_match('/^\s*(insert|update|delete|replace)\b/i', $query->sql)) {
+            ParityRecorder::$writes[] = array('sql' => $query->sql, 'bindings' => parity_value($query->bindings, 0));
+        }
+    });
+    $app['events']->listen('Illuminate\Log\Events\MessageLogged', function ($event) {
+        if (in_array($event->level, array('emergency', 'alert', 'critical', 'error', 'warning'), true)) {
+            ParityRecorder::$logs[] = $event->level.': '.substr((string) $event->message, 0, 400);
+        }
+    });
+}
+
+/** Roll back, record the effects into the row, and leave the app for the next one. */
+function parity_finish($app, $connection, array $row, $started)
+{
+    $row['ms'] = (int) round((microtime(true) - $started) * 1000);
+    while ($connection->transactionLevel() > 0) {
+        $connection->rollBack();
+    }
+    $row['queries'] = ParityRecorder::$queries;
+    $row['effects'] = parity_effects($app, ParityRecorder::$writes, ParityRecorder::$logs);
+
+    foreach (array('Illuminate\Support\Carbon', 'Carbon\Carbon', 'Carbon\CarbonImmutable') as $carbon) {
+        if (class_exists($carbon)) {
+            $carbon::setTestNow();
+        }
+    }
+    $app->flush();
+    Illuminate\Support\Facades\Facade::clearResolvedInstances();
+
+    return $row;
+}
+
 function parity_request($appPath, array $job, array $spec, array $tokens)
 {
     $guard = isset($spec['guard']) ? $spec['guard'] : null;
@@ -423,43 +500,7 @@ function parity_request($appPath, array $job, array $spec, array $tokens)
     );
 
     list($app, $kernel) = parity_boot($appPath, $job, false, $request);
-    ParityBroadcaster::$sent = array();
-
-    if (! empty($job['clock'])) {
-        foreach (array('Illuminate\Support\Carbon', 'Carbon\Carbon', 'Carbon\CarbonImmutable') as $carbon) {
-            if (class_exists($carbon)) {
-                $carbon::setTestNow($carbon::parse($job['clock']));
-            }
-        }
-    }
-    // every disk goes to a throwaway folder: a DELETE must not remove real uploads, a POST must not leave files
-    foreach (array_keys((array) $app['config']->get('filesystems.disks')) as $disk) {
-        try {
-            Illuminate\Support\Facades\Storage::fake($disk);
-        } catch (Throwable $e) {
-        }
-    }
-    Illuminate\Support\Facades\Queue::fake();
-    Illuminate\Support\Facades\Mail::fake();
-    Illuminate\Support\Facades\Notification::fake();
-    if (class_exists('Illuminate\Support\Facades\Http')) {
-        Illuminate\Support\Facades\Http::fake();
-    }
-
-    $writes = array();
-    $logs = array();
-    $queries = 0;
-    $app['db']->listen(function ($query) use (&$writes, &$queries) {
-        $queries++;
-        if (preg_match('/^\s*(insert|update|delete|replace)\b/i', $query->sql)) {
-            $writes[] = array('sql' => $query->sql, 'bindings' => parity_value($query->bindings, 0));
-        }
-    });
-    $app['events']->listen('Illuminate\Log\Events\MessageLogged', function ($event) use (&$logs) {
-        if (in_array($event->level, array('emergency', 'alert', 'critical', 'error', 'warning'), true)) {
-            $logs[] = $event->level.': '.substr((string) $event->message, 0, 400);
-        }
-    });
+    parity_record($app, $job);
 
     if ($guard && empty($tokens[$guard]) && isset($job['users'][$guard])) {
         // no token could be made: sign in through the guard instead
@@ -496,22 +537,274 @@ function parity_request($appPath, array $job, array $spec, array $tokens)
         $row['sha1'] = sha1($printed);
         $row['content_type'] = substr($printed, 0, 4) === '%PDF' ? 'application/pdf' : 'text/plain (printed)';
     }
-    $row['ms'] = (int) round((microtime(true) - $started) * 1000);
-    while ($connection->transactionLevel() > 0) {
-        $connection->rollBack();
-    }
-    $row['queries'] = $queries;
-    $row['effects'] = parity_effects($app, $writes, $logs);
 
-    foreach (array('Illuminate\Support\Carbon', 'Carbon\Carbon', 'Carbon\CarbonImmutable') as $carbon) {
-        if (class_exists($carbon)) {
-            $carbon::setTestNow();
+    return parity_finish($app, $connection, $row, $started);
+}
+
+/** The app's own console commands, its schedule and its queued jobs (what can run outside a request). */
+function parity_console_list($app, $kernel, $appPath)
+{
+    $commands = array();
+    foreach ($kernel->all() as $name => $command) {
+        $class = get_class($command);
+        if (strpos($class, 'App\\') !== 0) {
+            continue;
+        }
+        $required = array();
+        foreach ($command->getDefinition()->getArguments() as $argument) {
+            if ($argument->isRequired()) {
+                $required[] = $argument->getName();
+            }
+        }
+        $commands[] = array('name' => $name, 'class' => $class, 'required' => $required);
+    }
+
+    $schedule = array();
+    try {
+        foreach ($app->make('Illuminate\Console\Scheduling\Schedule')->events() as $event) {
+            $schedule[] = array(
+                'task' => method_exists($event, 'getSummaryForDisplay') ? $event->getSummaryForDisplay() : (string) $event->command,
+                'command' => (string) $event->command,
+                'expression' => $event->expression,
+                'timezone' => is_object($event->timezone) ? $event->timezone->getName() : (string) $event->timezone,
+                'without_overlapping' => (bool) $event->withoutOverlapping,
+                'on_one_server' => (bool) $event->onOneServer,
+            );
+        }
+    } catch (Throwable $e) {
+        $schedule[] = array('error' => get_class($e).': '.$e->getMessage());
+    }
+
+    $jobs = array();
+    if (is_dir("$appPath/app/Jobs")) {
+        $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator("$appPath/app/Jobs", FilesystemIterator::SKIP_DOTS));
+        foreach ($files as $file) {
+            if (substr($file->getFilename(), -4) !== '.php') {
+                continue;
+            }
+            $source = file_get_contents($file->getPathname());
+            if (! preg_match('/^\s*namespace\s+([\w\\\\]+)\s*;/m', $source, $ns) || ! preg_match('/^\s*(?:final\s+|abstract\s+)*class\s+(\w+)/m', $source, $cl)) {
+                continue;
+            }
+            $class = $ns[1].'\\'.$cl[1];
+            try {
+                if (! class_exists($class)) {
+                    continue;
+                }
+                $reflection = new ReflectionClass($class);
+                if ($reflection->isAbstract() || ! $reflection->hasMethod('handle')) {
+                    continue;
+                }
+                $params = array();
+                $constructor = $reflection->getConstructor();
+                foreach ($constructor ? $constructor->getParameters() : array() as $param) {
+                    $type = $param->getType();
+                    $params[] = array(
+                        'name' => $param->getName(),
+                        'type' => $type ? ($type instanceof ReflectionNamedType ? $type->getName() : (string) $type) : null,
+                        'optional' => $param->isOptional(),
+                        'nullable' => $param->allowsNull(),
+                    );
+                }
+                $jobs[] = array('class' => $class, 'params' => $params,
+                    'queued' => $reflection->implementsInterface('Illuminate\Contracts\Queue\ShouldQueue'));
+            } catch (Throwable $e) {
+            }
         }
     }
-    $app->flush();
-    Illuminate\Support\Facades\Facade::clearResolvedInstances();
 
-    return $row;
+    return array('commands' => $commands, 'schedule' => $schedule, 'jobs' => $jobs);
+}
+
+/** A job's constructor arguments: given values, else the newest row of a model, a default, or null. */
+function parity_job_args(ReflectionClass $reflection, array $given)
+{
+    $args = array();
+    $constructor = $reflection->getConstructor();
+    foreach ($constructor ? $constructor->getParameters() : array() as $param) {
+        $name = $param->getName();
+        $type = $param->getType();
+        $class = $type instanceof ReflectionNamedType && ! $type->isBuiltin() ? $type->getName() : null;
+        if (array_key_exists($name, $given)) {
+            $value = $given[$name];
+            if ($class && is_subclass_of($class, 'Illuminate\Database\Eloquent\Model')) {
+                $value = $class::find($value);
+                if (! $value) {
+                    return array(null, "no $class with id {$given[$name]}");
+                }
+            }
+            $args[] = $value;
+        } elseif ($class && is_subclass_of($class, 'Illuminate\Database\Eloquent\Model')) {
+            $model = new $class();
+            $row = $class::query()->orderBy($model->getKeyName(), 'desc')->first();
+            if (! $row) {
+                return array(null, "no row in ".$model->getTable()." for \$$name");
+            }
+            $args[] = $row;
+        } elseif ($param->isOptional()) {
+            $args[] = $param->getDefaultValue();
+        } elseif ($type && $param->allowsNull()) {
+            // only a declared ?Type: an untyped $data given null is a guess the job was never written for
+            $args[] = null;
+        } else {
+            return array(null, "needs \$$name".($type ? ' ('.($type instanceof ReflectionNamedType ? $type->getName() : (string) $type).')' : ''));
+        }
+    }
+
+    return array($args, null);
+}
+
+/** One command or job, in a rolled-back transaction with everything leaving the app faked. */
+function parity_console_run($appPath, array $job, array $item)
+{
+    list($app, $kernel) = parity_boot($appPath, $job, true);
+    parity_record($app, $job);
+    $connection = $app['db']->connection();
+    $row = array('id' => $item['id']);
+    $instance = null;
+    if ($item['kind'] === 'job') {
+        $reflection = new ReflectionClass($item['class']);
+        list($args, $why) = parity_job_args($reflection, isset($item['args']) ? (array) $item['args'] : array());
+        if ($why !== null) {
+            $row['status'] = 'not-run';
+            $row['error'] = $why;
+
+            return parity_finish($app, $connection, $row, microtime(true));
+        }
+        $instance = $reflection->newInstanceArgs($args);
+    }
+    $connection->beginTransaction();
+    $started = microtime(true);
+    $level = ob_get_level();
+    ob_start();
+    try {
+        if ($instance) {
+            $app->call(array($instance, 'handle'));
+            $row['status'] = 0;
+            $row['output'] = '';
+        } else {
+            $arguments = isset($item['arguments']) ? (array) $item['arguments'] : array();
+            $arguments['--no-interaction'] = true;
+            $row['status'] = $kernel->call($item['name'], $arguments);
+            $row['output'] = substr($kernel->output(), 0, 4000);
+        }
+    } catch (Throwable $e) {
+        $row['status'] = 'runner-error';
+        $row['error'] = get_class($e).': '.$e->getMessage();
+        $row['file'] = substr($e->getFile(), strlen($appPath) + 1).':'.$e->getLine();
+    }
+    $printed = '';
+    while (ob_get_level() > $level) {
+        $printed = ob_get_clean().$printed;
+    }
+    if ($printed !== '') {
+        $row['output'] = (isset($row['output']) ? $row['output'] : '').substr($printed, 0, 2000);
+    }
+
+    return parity_finish($app, $connection, $row, $started);
+}
+
+/** Who may listen on each broadcast channel (routes/channels.php), asked the way /broadcasting/auth asks. */
+function parity_channels($app, array $job)
+{
+    $manager = $app->make('Illuminate\Broadcasting\BroadcastManager');
+    $patterns = array();
+    $options = array();
+    foreach (parity_prop($manager, 'drivers') as $driver) {
+        if ($driver instanceof ParityBroadcaster) {
+            continue;
+        }
+        $patterns = parity_prop($driver, 'channels');
+        $options = parity_has(get_class($driver), 'channelOptions', false) ? parity_prop($driver, 'channelOptions') : array();
+        if ($patterns) {
+            break;
+        }
+    }
+    $auth = new ParityBroadcaster();
+    foreach (array('channels' => $patterns, 'channelOptions' => $options) as $name => $value) {
+        if (parity_has('ParityBroadcaster', $name, false)) {
+            $property = new ReflectionProperty('Illuminate\Broadcasting\Broadcasters\Broadcaster', $name);
+            $property->setAccessible(true);
+            $property->setValue($auth, $value);
+        }
+    }
+    $verify = new ReflectionMethod($auth, 'verifyUserCanAccessChannel');
+    $verify->setAccessible(true);
+    // Pusher / Reverb refuse a channel before its callback when no user signs in through the channel's guards
+    $retrieve = method_exists($auth, 'retrieveUser') ? new ReflectionMethod($auth, 'retrieveUser') : null;
+    if ($retrieve) {
+        $retrieve->setAccessible(true);
+    }
+
+    // a guest never reaches the channel callbacks: /broadcasting/auth refuses before them
+    $who = array();
+    foreach ((array) $job['users'] as $guard => $id) {
+        $user = parity_user($app, $guard, $id);
+        if ($user) {
+            $who[$guard] = array($guard, $user);
+        }
+    }
+    $names = array();
+    foreach (array_keys($patterns) as $pattern) {
+        if (strpos($pattern, '{') === false) {
+            $names[$pattern] = $pattern;
+        }
+    }
+    foreach ((array) $job['channels'] as $name) {
+        $names[$name] = $name;
+    }
+    $answers = array();
+    foreach ($who as $label => $pair) {
+        $user = $pair ? $pair[1] : null;
+        $list = $names;
+        // a channel per user (App.Models.User.{id}, admin.{userId}): that user's own
+        foreach (array_keys($patterns) as $pattern) {
+            if ($user && preg_match('/^[^{]*\{\w+\}$/', $pattern)) {
+                $list[preg_replace('/\{\w+\}$/', '{user}', $pattern)] = preg_replace('/\{\w+\}$/', (string) $user->getKey(), $pattern);
+            }
+        }
+        foreach ($list as $key => $channel) {
+            if ($user) {
+                $app['auth']->guard($pair[0])->setUser($user);
+            }
+            $request = Illuminate\Http\Request::create('/broadcasting/auth', 'POST', array('channel_name' => 'private-'.$channel));
+            // a channel limited to a guard (['guards' => ['admin']]) sees the user only through that guard
+            $request->setUserResolver(function ($guard = null) use ($user, $label) {
+                return $guard === null || $guard === $label ? $user : null;
+            });
+            try {
+                if (! ($retrieve ? $retrieve->invoke($auth, $request, $channel) : $request->user())) {
+                    $answers[] = array('channel' => $key, 'who' => $label, 'answer' => 'denied');
+                    continue;
+                }
+                $result = $verify->invoke($auth, $request, $channel);
+                $answer = $result === true ? 'allowed' : 'allowed '.json_encode(parity_value($result, 0));
+            } catch (Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException $e) {
+                $answer = 'denied';
+            } catch (Throwable $e) {
+                $answer = 'error: '.get_class($e).': '.substr($e->getMessage(), 0, 200);
+            }
+            $answers[] = array('channel' => $key, 'who' => $label, 'answer' => $answer);
+        }
+    }
+    $route = null;
+    foreach ($app['router']->getRoutes() as $r) {
+        // broadcasting/auth, or prefixed (Laravel 11 withBroadcasting: api/broadcasting/auth)
+        if (substr($r->uri(), -strlen('broadcasting/auth')) === 'broadcasting/auth') {
+            $route = array('uri' => $r->uri(), 'methods' => array_values(array_diff($r->methods(), array('HEAD'))), 'middleware' => array_values($r->gatherMiddleware()));
+        }
+    }
+    $driver = $GLOBALS['parity_broadcast_default'];
+
+    return array(
+        'driver' => $driver,
+        'driver_config' => array_keys(array_filter((array) $app['config']->get("broadcasting.connections.$driver", array()), function ($v) {
+            return $v !== null && $v !== '';
+        })),
+        'patterns' => array_keys($patterns),
+        'auth_route' => $route,
+        'answers' => $answers,
+    );
 }
 
 $mode = isset($job['mode']) ? $job['mode'] : 'replay';
@@ -529,6 +822,42 @@ if ($mode === 'artisan') {
             parity_emit($out, array('command' => $name, 'exit' => 1, 'output' => get_class($e).': '.$e->getMessage()));
         }
     }
+    exit(0);
+}
+
+if ($mode === 'console') {
+    list($app, $kernel) = parity_boot($appPath, $job, true);
+    parity_emit($out, array('info' => parity_info($app), 'console' => parity_console_list($app, $kernel, $appPath)));
+    exit(0);
+}
+
+if ($mode === 'console-run') {
+    $seconds = isset($job['timeout']) ? (int) $job['timeout'] : 120;
+    set_time_limit($seconds);
+    foreach ((array) $job['items'] as $item) {
+        if (function_exists('pcntl_async_signals') && function_exists('pcntl_alarm')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGALRM, function () use ($out, $item, $seconds) {
+                parity_emit($out, array('id' => $item['id'], 'status' => 'timeout', 'error' => "still running after {$seconds}s"));
+                exit(0);
+            });
+            pcntl_alarm($seconds);
+        }
+        try {
+            parity_emit($out, parity_console_run($appPath, $job, $item));
+        } catch (Throwable $e) {
+            parity_emit($out, array('id' => $item['id'], 'status' => 'runner-error', 'error' => get_class($e).': '.$e->getMessage()));
+        }
+        if (function_exists('pcntl_alarm')) {
+            pcntl_alarm(0);
+        }
+    }
+    exit(0);
+}
+
+if ($mode === 'channels') {
+    list($app, $kernel) = parity_boot($appPath, $job, false);
+    parity_emit($out, array('info' => parity_info($app), 'channels' => parity_channels($app, $job)));
     exit(0);
 }
 

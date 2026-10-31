@@ -61,6 +61,35 @@ pub struct Config {
     /// The web app before the upgrade, and the one that ships with it (default: the same).
     pub web_old: Option<PathBuf>,
     pub web_new: Option<PathBuf>,
+    pub console: Console,
+}
+
+/// `[console]`: the app's commands and jobs, run on both apps.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Console {
+    /// false: only compare the lists and the schedule
+    pub run: bool,
+    /// seconds one command or job may run
+    pub timeout: u64,
+    /// command names or job classes not to run (globs)
+    pub skip: Vec<String>,
+    /// command name -> its arguments and options, e.g. { user = 1, "--dry-run" = true }
+    pub commands: BTreeMap<String, Value>,
+    /// job class -> constructor arguments by name (a model parameter takes an id)
+    pub jobs: BTreeMap<String, Value>,
+}
+
+impl Default for Console {
+    fn default() -> Self {
+        Console {
+            run: true,
+            timeout: 120,
+            skip: vec![],
+            commands: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -159,6 +188,8 @@ struct Raw {
     tests: Tests,
     #[serde(default)]
     web: RawWeb,
+    #[serde(default)]
+    console: Console,
 }
 
 #[derive(Deserialize, Default)]
@@ -361,5 +392,6 @@ pub fn load(path: &Path) -> Result<Config, String> {
         tests: raw.tests,
         web_old: raw.web.old.as_deref().map(expand),
         web_new: raw.web.new.as_deref().map(expand),
+        console: raw.console,
     })
 }

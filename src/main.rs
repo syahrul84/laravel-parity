@@ -1,15 +1,20 @@
 //! laravel-parity: run the same requests through an old and an upgraded Laravel app and report what differs.
 
+mod channels;
 mod code;
 mod codemap;
 mod compare;
 mod config;
+mod console;
 mod db;
 mod fixlist;
+mod gate;
 mod glob;
 mod guide;
+mod history;
 mod init;
 mod log;
+mod logs;
 mod mcp;
 mod ops;
 mod plan;
@@ -18,6 +23,7 @@ mod reports;
 mod routes;
 mod rules;
 mod runner;
+mod schema;
 mod testgen;
 mod update;
 mod web;
@@ -89,6 +95,45 @@ enum Command {
     Code { pair: PathBuf },
     /// Which of the web app's API calls the upgrade breaks (needs [web] in the pair file; Vue 2/3, Nuxt, React)
     Web { pair: PathBuf },
+    /// The database: what the upgrade's migrations change, and what the migrations alone build on an empty database
+    Schema { pair: PathBuf },
+    /// The app's artisan commands, queued jobs and schedule, run and compared on both apps
+    Console { pair: PathBuf },
+    /// Who may join each broadcast channel (Echo / Reverb), the /broadcasting/auth route and the driver
+    Channels { pair: PathBuf },
+    /// Add real requests from a web server access log as extra cases (successful GETs; secrets dropped)
+    ImportLog {
+        pair: PathBuf,
+        log: PathBuf,
+        /// At most this many different requests per route
+        #[arg(long, default_value_t = 5)]
+        per_route: usize,
+    },
+    /// Every pair file: where each upgrade stands, closest to release first
+    Overview,
+    /// Accept today's findings, so `ci` fails only on new ones
+    Baseline {
+        pair: PathBuf,
+        /// Where to keep it (default: runs/<name>/baseline.json)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// For CI: run the checks and fail (exit 1) on a new finding; writes junit.xml and a GitHub job summary
+    Ci {
+        pair: PathBuf,
+        /// Fail on new findings of this priority or worse (1 fix before release ... 4 know about)
+        #[arg(long, default_value_t = 1)]
+        fail_on: u8,
+        /// Judge the last results without running anything
+        #[arg(long)]
+        no_run: bool,
+        /// The test databases are already prepared: skip setup-db
+        #[arg(long)]
+        no_setup: bool,
+        /// The baseline file (default: runs/<name>/baseline.json)
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
     /// Rewrite the report from the last run
     Report { pair: PathBuf },
     /// Generate PHPUnit tests for shared routes that have none
@@ -113,7 +158,7 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// setup-db, routes, plan, run and tests
+    /// Everything: setup-db, routes, code, schema, web, plan, run, console, channels and tests
     All {
         pair: PathBuf,
         #[arg(long)]
@@ -174,6 +219,32 @@ fn main() {
         Command::Code { pair } => code::check(&load(&pair)).map(drop),
         Command::Web { pair } => web::check(&load(&pair)).map(drop),
         Command::Report { pair } => ops::report(&load(&pair)).map(drop),
+        Command::Schema { pair } => schema::check(&load(&pair)).map(drop),
+        Command::Console { pair } => console::check(&load(&pair)).map(drop),
+        Command::Channels { pair } => channels::check(&load(&pair)).map(drop),
+        Command::ImportLog {
+            pair,
+            log,
+            per_route,
+        } => logs::import(&load(&pair), &log, per_route).map(drop),
+        Command::Overview => history::overview().map(drop),
+        Command::Baseline { pair, file } => {
+            gate::baseline(&load(&pair), file.as_deref()).map(|line| say(&line))
+        }
+        Command::Ci {
+            pair,
+            fail_on,
+            no_run,
+            no_setup,
+            baseline,
+        } => gate::ci(
+            &load(&pair),
+            no_run,
+            !no_setup,
+            fail_on,
+            baseline.as_deref(),
+        )
+        .map(drop),
         Command::Tests {
             pair,
             no_verify,

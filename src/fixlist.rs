@@ -20,7 +20,8 @@ use crate::routes::RouteDiff;
 pub struct Fix {
     /// 1 = fix before release ... 4 = know about it
     pub priority: u8,
-    /// API, Access, Validation, UI, Response, Side effects, Not checked
+    /// API, Access, Validation, UI, Code, Database, Jobs & commands, Broadcasting, Response, Side effects, Speed,
+    /// Not checked
     pub area: String,
     pub title: String,
     #[serde(default)]
@@ -568,7 +569,9 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
     // scenarios someone added that crash on both apps: a bug the old code already had
     let ai_crashes: Vec<String> = results
         .iter()
-        .filter(|r| r.verdict == "both-fail" && r.case.starts_with("ai-"))
+        .filter(|r| {
+            r.verdict == "both-fail" && (r.case.starts_with("ai-") || r.case.starts_with("log-"))
+        })
         .map(|r| {
             format!(
                 "{}: {}",
@@ -581,7 +584,7 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
         add(Fix {
             priority: 3,
             area: "API".into(),
-            title: format!("{} added scenarios crash on both apps (bugs the old code already had)", ai_crashes.len()),
+            title: format!("{} added scenarios (AI or access log) crash on both apps (bugs the old code already had)", ai_crashes.len()),
             location: None,
             hint: Some("Not caused by the upgrade, and no test can expect them until the code answers properly (a 404 or 422 instead of a 500).".into()),
             routes: vec![],
@@ -635,6 +638,12 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
         });
     }
 
+    // the database, commands / jobs / schedule and broadcast channels (their own steps), and speed
+    fixes.extend(crate::schema::fixes(config));
+    fixes.extend(crate::console::fixes(config));
+    fixes.extend(crate::channels::fixes(config));
+    fixes.extend(speed(&results));
+
     fixes.sort_by(|a, b| {
         (
             a.priority,
@@ -646,6 +655,56 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
             ))
     });
     Ok(fixes)
+}
+
+/// Routes that answer the same but work much harder on the new app: many more queries (an N+1 the upgrade brought:
+/// a lost eager load, a relation renamed) or much slower. Time is noisy (other machines, other MySQL); queries are not.
+pub fn speed(results: &[Outcome]) -> Vec<Fix> {
+    let answered =
+        |r: &&Outcome| !["new-broken", "both-fail", "new-fixed"].contains(&r.verdict.as_str());
+    let mut more: Vec<(i64, String)> = results
+        .iter()
+        .filter(answered)
+        .filter_map(|r| {
+            let [a, b] = r.queries?;
+            (b >= a * 2 && b - a >= 10)
+                .then(|| (b - a, format!("{}: {a} -> {b} queries", r.name())))
+        })
+        .collect();
+    let mut slower: Vec<(i64, String)> = results
+        .iter()
+        .filter(answered)
+        .filter_map(|r| {
+            let [a, b] = r.ms?;
+            (b >= a * 3 && b - a >= 500).then(|| (b - a, format!("{}: {a} -> {b} ms", r.name())))
+        })
+        .collect();
+    more.sort_by_key(|x| std::cmp::Reverse(x.0));
+    slower.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut out = vec![];
+    if !more.is_empty() {
+        out.push(Fix {
+            priority: 3,
+            area: "Speed".into(),
+            title: format!("{} routes run far more database queries on the new app", more.len()),
+            location: None,
+            hint: Some("Usually an N+1: an eager load (with()) or a relation lost or renamed in the upgrade, or a $with removed from a model. Production data makes it worse than the test copy.".into()),
+            routes: vec![],
+            details: more.into_iter().map(|(_, d)| d).collect(),
+        });
+    }
+    if !slower.is_empty() {
+        out.push(Fix {
+            priority: 4,
+            area: "Speed".into(),
+            title: format!("{} routes answer much slower on the new app", slower.len()),
+            location: None,
+            hint: Some("Times depend on the machine and MySQL server each app ran on; rerun the route to confirm before digging in.".into()),
+            routes: vec![],
+            details: slower.into_iter().map(|(_, d)| d).collect(),
+        });
+    }
+    out
 }
 
 const PRIORITY: [&str; 4] = ["Fix before release", "Fix soon", "Check", "Know about"];

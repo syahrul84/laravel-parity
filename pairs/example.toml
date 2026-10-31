@@ -74,6 +74,17 @@ mask = []
 # old = "~/code/shop-web"
 # new = "~/code/shop-web"   # default: the same as old
 
+# The app's own artisan commands and queued jobs, run on both apps (rolled back, faked, time-limited).
+[console]
+run = true                 # false: only compare the lists and the schedule
+timeout = 120              # seconds per command or job
+skip = []                  # names or classes not to run, e.g. ["app:import-*", "App\\Jobs\\SyncToBank"]
+# arguments for commands that need them, and constructor arguments for jobs (a model parameter takes an id)
+# [console.commands]
+# "report:send" = { company = 1, "--dry-run" = true }
+# [console.jobs]
+# "App\Jobs\SendInvoice" = { invoice = 42 }
+
 [tests]
 dir = "tests/Feature/Parity"
 namespace = "Tests\\Feature\\Parity"

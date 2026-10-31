@@ -10,9 +10,15 @@ code as the truth and checks that the upgraded code behaves the same:
 1. it runs both apps side by side, on copies of the old database, and sends every route the same requests (signed in,
    not signed in, real and missing records, valid and invalid input)
 2. it compares what each app answered and did (status, JSON, rows written, jobs, mail, notifications, broadcasts)
-3. it checks the upgraded code without running it, for the problems upgrades typically leave behind (methods that no
+3. it does the same for what runs outside a request: the app's artisan commands and queued jobs run on both apps, and
+   the schedule is compared (Laravel 11 moved it to routes/console.php)
+4. it compares the database: what the upgrade's migrations do to the real data, and whether the migrations alone
+   build the same schema on an empty database (after moving from Propel or hand-made SQL to Laravel migrations)
+5. it checks broadcasting: who may still join each private and presence channel, and the driver (Echo with Pusher to
+   Reverb)
+6. it checks the upgraded code without running it, for the problems upgrades typically leave behind (methods that no
    longer exist, date fields that lost their casting, Carbon 3, removed helpers, PHP 8.x changes)
-4. it reads your web app, if there is one (Vue 2, Vue 3, Nuxt), for the screens whose API calls the upgrade breaks
+7. it reads your web app, if there is one (Vue 2, Vue 3, Nuxt), for the screens whose API calls the upgrade breaks
 
 What you get is **a list of what to fix before you release**, worst first, each with the file and line and the usual
 cause; a report of every difference; and **PHPUnit tests** for the routes that had none, so the new code stays the way
@@ -33,12 +39,17 @@ Docker is optional. Nothing is written to your real database. Built on
      that are gone
   3. *Check*: lost response fields, changed status codes, different rows written / jobs / mail / broadcasts
   4. *Know about*: what could not be checked, and why
-  Plus a **Code** area, found without running anything: routes pointing to controller methods that no longer
+  Plus a **Database** area (dropped or narrowed columns, changed defaults, lost unique keys and indexes, what the
+  migrations alone do not build), **Jobs & commands** (scheduled tasks missing on the new app, commands and jobs that
+  now fail or do different work, job classes gone while queued jobs still name them), **Broadcasting** (channel
+  subscriptions now refused or newly allowed, a missing /broadcasting/auth, Reverb settings), **Speed** (routes that
+  now run far more queries: an N+1 the upgrade brought), and a **Code** area, found without running anything: routes pointing to controller methods that no longer
   exist (codemap `doctor`, new vs already there), upgrade traps picked by your version jump (models whose `$dates`
   fields lost their casting in Laravel 10, Carbon 3 `diffIn*` now signed and fractional, removed helpers and facades,
   PHP 8.x removals and deprecations) with file:line and the fix, files the new PHP cannot parse, and PHPStan /
   Larastan findings when the repo has it
-- **`report.md`**: every route and case, old answer vs new answer
+- **`report.md`**: every route and case, old answer vs new answer. Both files start with **since the last run**: what
+  your fixes fixed and what broke since
 - **PHPUnit tests** in the new repo for routes without one: one test per route with a data provider of its cases
   (happy path, not signed in, missing record, empty and incomplete bodies), each expecting what the old app did
 - For AI assistants: an **MCP server**, so Claude Code (or any MCP client) can run it, read the fix list, look at one
@@ -56,7 +67,13 @@ Each route is sent several ways, on both apps, and the old app's answer is the e
 | empty / without-*field* | a save with an empty body, and with each required field left out |
 
 Compared: status code, JSON body (timestamps, tokens and URLs ignored), rows written, queued jobs, mail,
-notifications, broadcasts (event, channel) and outgoing HTTP calls.
+notifications, broadcasts (event, channel, payload fields), outgoing HTTP calls, and the number of database queries.
+
+Ids are picked to belong together, like a real user's request: a row of the project / company the pair file sends
+by default, and for `projects/{project}/units/{unit}` a unit of that project (declared foreign keys or the
+`project_id` naming). Real requests can be added from an access log: `laravel-parity import-log pairs/shop.toml
+access.log` turns successful GETs (ids, filters, sorting, paging) into extra cases; values that look like secrets
+are dropped.
 
 ## Install
 
@@ -96,11 +113,40 @@ laravel-parity all pairs/shop.toml                     # everything; then open r
 | `check` | PHP, Laravel and MySQL of each app, sign-in, and whether every Laravel internal the tool reads exists |
 | `routes` | both route lists and what was removed, added or changed |
 | `code` | problems in the new code without running it (codemap doctor, upgrade traps, syntax, PHPStan) |
+| `schema` | the database: the old one against its migrated copy, and against the migrations alone on an empty database |
 | `web` | the web app's API calls the upgrade breaks (with `[web]` in the pair file; optional) |
 | `plan` | the requests and their cases, in `runs/<name>/requests.json` (edit a body there to test a real save) |
 | `run` | every request on both apps; writes `report.md` and `fixes.md` (`--only "api/orders"` re-runs just those) |
+| `console` | the app's commands and queued jobs, run on both apps (time-limited, rolled back), and the schedule |
+| `channels` | who may join each broadcast channel on both apps, /broadcasting/auth, the driver (after `run`) |
 | `tests` | PHPUnit tests for routes without one, run in the new app |
+| `import-log` | real requests from an nginx / Apache access log as extra cases |
+| `overview` | every pair file: where each upgrade stands, closest to release first, and the change since its last run |
+| `baseline` / `ci` | for CI: accept today's findings, then fail the build on a new one (below) |
 | `reports` | problems with the tool itself, which you can send to this repo (you see exactly what is sent first) |
+
+## In CI
+
+```sh
+laravel-parity baseline pairs/shop.toml        # once: accept today's findings
+laravel-parity ci pairs/shop.toml              # every build: run the checks, exit 1 on a new priority-1 finding
+```
+
+`--fail-on 2` also fails on new priority-2 findings; `--no-run` judges the last results without running anything;
+`--no-setup` keeps test databases that are already prepared. Each run writes `runs/<name>/junit.xml` (one test per
+finding) and, on GitHub Actions, a job summary. The runner needs both apps and MySQL, so CI usually runs on a
+self-hosted runner next to them:
+
+```yaml
+jobs:
+  parity:
+    runs-on: self-hosted
+    steps:
+      - run: laravel-parity ci pairs/shop.toml --baseline pairs/shop.baseline.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: parity, path: runs/shop }
+```
 
 ## For AI assistants (MCP)
 
@@ -108,9 +154,9 @@ The installer registers `laravel-parity serve` with Claude Code for all projects
 to use it (upgrades, Laravel Shift, "does the new code behave the same"). The loop it follows:
 `fix_list` → `show` a route (old and new answer, exception, first frames) → fix the code → `rerun` that route.
 
-Tools: `guide`, `list_pairs`, `init_pair`, `check`, `setup_db`, `plan`, `run`, `rerun`, `code_check`, `web_check`, `status`,
-`summary`, `fix_list`, `results`, `show`, `set_request`, `generate_tests`, `test_results`, `test_gaps`, `add_case`,
-`report_problem`. Long steps run as background jobs polled with `status`.
+Tools: `guide`, `list_pairs`, `init_pair`, `check`, `setup_db`, `plan`, `run`, `rerun`, `code_check`, `schema_check`,
+`console_check`, `channels_check`, `web_check`, `status`, `summary`, `overview`, `fix_list`, `results`, `show`,
+`set_request`, `import_log`, `generate_tests`, `test_results`, `test_gaps`, `add_case`, `report_problem`. Long steps run as background jobs polled with `status`.
 
 ### More test scenarios, written by the AI
 
@@ -137,6 +183,8 @@ which the tool never touches.
   which is only read. Names without `parity` are refused, and the runner stops if an app is not on its test database.
 - Every request runs in a transaction that is **rolled back**.
 - Mail, notifications, queued jobs, broadcasts and file storage are **faked** (recorded, never sent or written).
+- Commands and jobs run the same way, and each is stopped after `[console] timeout` seconds (default 120); commands
+  that serve or never end (`queue:work`, `reverb:start`, `horizon` ...) are never run.
 - **Outgoing internet traffic is blocked** (Laravel's HTTP client faked; Guzzle, curl and PHP streams sent to a proxy
   that does not exist).
 - Problem reports never leave the machine unless you send one, and contain no response bodies, ids, hosts or names.

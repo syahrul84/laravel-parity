@@ -396,6 +396,10 @@ pub fn run(
     }
     let meta_file = config.work.join("run.json");
     let partial = only.is_some() || resume;
+    if !resume {
+        // "since the last run" compares with these
+        crate::history::keep_previous(config);
+    }
     let mut meta: Value = if partial {
         read(&meta_file).unwrap_or(json!({}))
     } else {
@@ -571,12 +575,25 @@ pub fn report(config: &Config) -> Res<String> {
     )
     .map_err(|e| e.to_string())?;
     let fixes = crate::fixlist::write_all(config)?;
+    let since = crate::history::changes(config, &results).map(|changes| {
+        let section = crate::history::section(&changes);
+        crate::history::annotate(&path, &section);
+        crate::history::annotate(&config.work.join("fixes.md"), &section);
+        let count = |k: &str| changes[k].as_array().map_or(0, Vec::len);
+        format!(
+            " Since the last run: {} fixed, {} newly broken.",
+            count("fixed"),
+            count("broken")
+        )
+    });
+    crate::history::record(config, &results, &fixes);
     let line = format!(
-        "Result: {}. Report: {}. Fix list: {} items in {}",
+        "Result: {}. Report: {}. Fix list: {} items in {}.{}",
         counts_line(&results),
         path.display(),
         fixes.len(),
-        config.work.join("fixes.md").display()
+        config.work.join("fixes.md").display(),
+        since.unwrap_or_default()
     );
     say(&line);
     Ok(line)
@@ -794,10 +811,14 @@ pub fn all(config: &Config, workers: Option<usize>) -> Res<String> {
     setup_db(config, false)?;
     routes(config)?;
     crate::code::check(config)?;
+    crate::schema::check(config)?;
     if config.web_old.is_some() {
         crate::web::check(config)?;
     }
     plan(config)?;
     run(config, None, false, workers)?;
+    crate::console::check(config)?;
+    // after the run: the channel names come from what the requests and commands broadcast
+    crate::channels::check(config)?;
     tests(config, true, false)
 }

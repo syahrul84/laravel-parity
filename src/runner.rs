@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -99,6 +100,69 @@ pub fn run_job(
     job: &Value,
     slot: usize,
 ) -> Result<Vec<Value>, String> {
+    run_job_timed(config, side, job, slot, None)
+}
+
+/// A child's output, killed (and `timed_out`) when it runs longer than `limit`. `stop` kills what the child started
+/// elsewhere (the PHP process inside a container, which killing `docker exec` leaves running).
+fn wait_output(
+    mut command: Command,
+    limit: Option<Duration>,
+    stop: impl Fn(),
+) -> Result<(Output, bool), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![];
+        let _ = out.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = vec![];
+        let _ = err.read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if limit.is_some_and(|l| started.elapsed() > l) {
+            timed_out = true;
+            stop();
+            let _ = child.kill();
+            break child.wait().map_err(|e| e.to_string())?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok((
+        Output {
+            status,
+            stdout: reader.join().unwrap_or_default(),
+            stderr: err_reader.join().unwrap_or_default(),
+        },
+        timed_out,
+    ))
+}
+
+/// `run_job`, stopped after `timeout` seconds (a console command that never ends); the rows written so far come
+/// back with a `runner_timeout` row.
+pub fn run_job_timed(
+    config: &Config,
+    side: &Side,
+    job: &Value,
+    slot: usize,
+    timeout: Option<u64>,
+) -> Result<Vec<Value>, String> {
+    let limit = timeout.map(Duration::from_secs);
     let mut job = job.clone();
     job["database"] = database_settings(config, side);
     let job_text = serde_json::to_string(&job).unwrap();
@@ -146,7 +210,16 @@ pub fn run_job(
                 &format!("--job={dir}/job.json"),
                 &format!("--out={dir}/out.jsonl"),
             ]);
-            let result = command.output().map_err(|e| e.to_string());
+            let pid_file = format!("{dir}/pid");
+            let result = wait_output(command, limit, || {
+                let _ = docker(&[
+                    "exec",
+                    container,
+                    "sh",
+                    "-c",
+                    &format!("kill -9 $(cat {pid_file}) 2>/dev/null"),
+                ]);
+            });
             let _ = docker(&["exec", container, "rm", "-f", &format!("{dir}/job.json")]);
             let _ = docker(&[
                 "cp",
@@ -167,9 +240,10 @@ pub fn run_job(
             for (k, v) in proxy_env(config) {
                 command.env(k, v);
             }
-            command.output().map_err(|e| format!("{php}: {e}"))?
+            wait_output(command, limit, || {}).map_err(|e| format!("{php}: {e}"))?
         }
     };
+    let (output, timed_out) = output;
 
     let mut rows: Vec<Value> = std::fs::read_to_string(&out_file)
         .unwrap_or_default()
@@ -177,6 +251,10 @@ pub fn run_job(
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    if timed_out {
+        rows.push(json!({"runner_timeout": timeout}));
+        return Ok(rows);
+    }
     if output.status.code() == Some(RESTART) && !rows.is_empty() {
         // the runner stopped on purpose (its output was spoiled): the requests it did not reach run again
         rows.push(json!({"runner_restart": true}));

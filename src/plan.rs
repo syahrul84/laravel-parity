@@ -141,26 +141,96 @@ pub fn candidate_tables(uri: &str, param: &str) -> Vec<String> {
 }
 
 /// Finds a real value for a table in the old test database (both test databases hold the same rows).
+///
+/// Values are picked to belong together, the way a real user's request would: a row of the project / company / user
+/// the pair file sends by default (`project_id` in [run] query or body, or the my-project-id header), and a child row
+/// of the parent the same route already picked ({project}/units/{unit}: a unit of that project), through declared
+/// foreign keys or the `<parent>_id` naming. When no row matches, the conditions are dropped one by one.
 pub struct Sampler<'a> {
     config: &'a Config,
     conn: mysql::Conn,
     pub tables: BTreeMap<String, TableInfo>,
     cache: HashMap<String, Option<String>>,
-    project: Option<String>,
+    /// (column, value) every pick prefers: the pair file's defaults
+    scope: Vec<(String, String)>,
+    /// (table, value) the current route already picked
+    chosen: Vec<(String, String)>,
+    /// (table, column) -> the table its foreign key points at
+    foreign: HashMap<(String, String), String>,
+}
+
+/// "units" -> "unit", "companies" -> "company", "addresses" -> "address".
+pub fn singular(table: &str) -> String {
+    if let Some(stem) = table.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if let Some(stem) = table
+        .strip_suffix("sses")
+        .or_else(|| table.strip_suffix("xes"))
+    {
+        format!("{stem}{}", if table.ends_with("sses") { "ss" } else { "x" })
+    } else if let Some(stem) = table.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        table.to_string()
+    }
+}
+
+/// The (column, value) pairs the pair file sends with every request: *_id fields of [run] query / body, and the
+/// project header.
+pub fn default_scope(config: &Config) -> Vec<(String, String)> {
+    let mut scope: Vec<(String, String)> = vec![];
+    let text = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    if let Some(project) = config.headers.get("my-project-id").and_then(text) {
+        scope.push(("project_id".into(), project));
+    }
+    for (key, value) in config
+        .default_query
+        .iter()
+        .chain(config.default_body.iter())
+    {
+        if key.ends_with("_id")
+            && let Some(v) = text(value)
+            && !scope.iter().any(|(k, _)| k == key)
+        {
+            scope.push((key.clone(), v));
+        }
+    }
+    scope
 }
 
 impl<'a> Sampler<'a> {
     pub fn new(config: &'a Config) -> Result<Self, String> {
+        let mut conn = db::connect(config, &config.old)?;
+        let foreign = db::rows(
+            &mut conn,
+            &format!(
+                "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
+                 WHERE TABLE_SCHEMA = '{}' AND REFERENCED_TABLE_NAME IS NOT NULL",
+                config.old.database.replace('\'', "''")
+            ),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| Some(((r[0].clone()?, r[1].clone()?), r[2].clone()?)))
+        .collect();
         Ok(Sampler {
             config,
-            conn: db::connect(config, &config.old)?,
+            conn,
             tables: db::tables(config, &config.old)?,
             cache: HashMap::new(),
-            project: config
-                .headers
-                .get("my-project-id")
-                .map(|v| v.as_str().map(String::from).unwrap_or(v.to_string())),
+            scope: default_scope(config),
+            chosen: vec![],
+            foreign,
         })
+    }
+
+    /// A new route: what the last one picked no longer applies.
+    pub fn start_route(&mut self) {
+        self.chosen.clear();
     }
 
     pub fn by_name(&mut self, uri: &str, param: &str) -> (Option<String>, String) {
@@ -202,6 +272,41 @@ impl<'a> Sampler<'a> {
         }
     }
 
+    /// The conditions a row of `table` should meet, most important first: its parent picked by this route, then the
+    /// pair file's defaults.
+    fn conditions(&self, table: &str, info: &TableInfo) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = vec![];
+        for (parent, value) in self.chosen.iter().rev() {
+            if parent == table {
+                continue;
+            }
+            let named = format!("{}_id", singular(parent));
+            for column in &info.columns {
+                let points = self
+                    .foreign
+                    .get(&(table.to_string(), column.clone()))
+                    .is_some_and(|t| t == parent);
+                if (points || *column == named || column.ends_with(&format!("_{named}")))
+                    && !found.iter().any(|(c, _)| c == column)
+                {
+                    found.push((column.clone(), value.clone()));
+                }
+            }
+        }
+        for (key, value) in &self.scope {
+            // project_id, or prefixed: unit_project_id
+            if let Some(column) = info
+                .columns
+                .iter()
+                .find(|c| *c == key || c.ends_with(&format!("_{key}")))
+                && !found.iter().any(|(c, _)| c == column)
+            {
+                found.push((column.clone(), value.clone()));
+            }
+        }
+        found
+    }
+
     fn cached(
         &mut self,
         key: &str,
@@ -209,37 +314,43 @@ impl<'a> Sampler<'a> {
         info: &TableInfo,
         column: Option<&str>,
     ) -> Option<String> {
-        if !self.cache.contains_key(key) {
-            let value = self.pick(table, info, column);
-            self.cache.insert(key.to_string(), value);
+        let conditions = self.conditions(table, info);
+        let cache_key = format!("{key}|{conditions:?}");
+        if !self.cache.contains_key(&cache_key) {
+            let value = self.pick(table, info, column, &conditions);
+            self.cache.insert(cache_key.clone(), value);
         }
-        self.cache[key].clone()
+        let value = self.cache[&cache_key].clone();
+        // the route's later parameters pick children of this row
+        if let Some(v) = &value
+            && (column.is_none() || column == info.pk.as_deref())
+        {
+            self.chosen.push((table.to_string(), v.clone()));
+        }
+        value
     }
 
-    fn pick(&mut self, table: &str, info: &TableInfo, column: Option<&str>) -> Option<String> {
+    fn pick(
+        &mut self,
+        table: &str,
+        info: &TableInfo,
+        column: Option<&str>,
+        conditions: &[(String, String)],
+    ) -> Option<String> {
         let col = column.map(String::from).or(info.pk.clone())?;
-        let mut wheres = vec![if column.is_some() {
-            format!(" WHERE `{col}` IS NOT NULL")
-        } else {
-            String::new()
-        }];
-        // prefer a row of the project the requests are made in (project_id, or prefixed: unit_project_id)
-        let scoped = info
-            .columns
-            .iter()
-            .find(|c| *c == "project_id" || c.ends_with("_project_id"));
-        if let (Some(project), Some(scoped)) = (&self.project, scoped) {
-            let joiner = if column.is_some() { " AND" } else { " WHERE" };
-            wheres.insert(
-                0,
-                format!(
-                    "{}{joiner} `{scoped}` = '{}'",
-                    wheres[0],
-                    project.replace('\'', "''")
-                ),
-            );
-        }
-        for clause in wheres {
+        let base = column.map(|_| format!("`{col}` IS NOT NULL"));
+        // all conditions, then fewer (the least important dropped first), then none
+        for keep in (0..=conditions.len()).rev() {
+            let mut clauses: Vec<String> = conditions[..keep]
+                .iter()
+                .map(|(c, v)| format!("`{c}` = '{}'", v.replace('\'', "''")))
+                .collect();
+            clauses.extend(base.clone());
+            let clause = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", clauses.join(" AND "))
+            };
             let sql = format!(
                 "SELECT `{col}` FROM `{}`.`{table}`{clause} ORDER BY `{col}` DESC LIMIT 1",
                 self.config.old.database
@@ -478,6 +589,7 @@ pub fn build(
         }
 
         let mut filled = spec.values.clone();
+        sampler.start_route();
         for cap in PARAM.captures_iter(uri) {
             let (param, optional) = (cap[1].to_string(), cap.get(2).is_some());
             if filled.contains_key(&param) {
@@ -685,4 +797,18 @@ pub fn variant(spec: &Spec, case: &str) -> Spec {
     copy.note = None;
     copy.without = vec![];
     copy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn singulars() {
+        assert_eq!(singular("units"), "unit");
+        assert_eq!(singular("companies"), "company");
+        assert_eq!(singular("addresses"), "address");
+        assert_eq!(singular("boxes"), "box");
+        assert_eq!(singular("staff"), "staff");
+    }
 }

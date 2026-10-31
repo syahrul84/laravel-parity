@@ -60,6 +60,12 @@ pub struct Outcome {
     pub old_status: Value,
     pub new_status: Value,
     pub notes: Vec<String>,
+    /// Database queries [old, new], when both apps answered
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<[i64; 2]>,
+    /// Milliseconds [old, new], when both apps answered
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<[i64; 2]>,
 }
 
 pub struct Rules<'a> {
@@ -313,14 +319,39 @@ pub fn effect_summary(row: &Value) -> Vec<(&'static str, Vec<String>)> {
             "broadcasts",
             list("broadcasts", &|b| {
                 format!(
-                    "{} on {}",
+                    "{} on {}{}",
                     scalar_text(&b["event"]),
-                    strings(&b["channels"]).join(",")
+                    strings(&b["channels"]).join(","),
+                    payload_keys(&b["payload"])
                 )
             }),
         ),
         ("http", http),
     ]
+}
+
+/// A broadcast payload's fields (two levels deep), not their values: the web app reads the fields, the values carry
+/// ids and times.
+fn payload_keys(payload: &Value) -> String {
+    fn walk(v: &Value, prefix: &str, depth: usize, out: &mut Vec<String>) {
+        if let Value::Object(map) = v {
+            for (k, child) in map {
+                let path = format!("{prefix}{k}");
+                out.push(path.clone());
+                if depth < 2 {
+                    walk(child, &format!("{path}."), depth + 1, out);
+                }
+            }
+        }
+    }
+    let mut keys = vec![];
+    walk(payload, "", 1, &mut keys);
+    keys.sort();
+    if keys.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", keys.join(","))
+    }
 }
 
 fn minus(a: &[String], b: &[String]) -> Vec<String> {
@@ -404,6 +435,8 @@ pub fn compare(spec: &Spec, old: Option<&Value>, new: Option<&Value>, rules: &Ru
         old_status: Value::Null,
         new_status: Value::Null,
         notes: vec![],
+        queries: None,
+        ms: None,
     };
     let (Some(old), Some(new)) = (old, new) else {
         outcome.verdict = "both-fail".into();
@@ -415,6 +448,9 @@ pub fn compare(spec: &Spec, old: Option<&Value>, new: Option<&Value>, rules: &Ru
     };
     outcome.old_status = old["status"].clone();
     outcome.new_status = new["status"].clone();
+    let pair = |key: &str| Some([old[key].as_i64()?, new[key].as_i64()?]);
+    outcome.queries = pair("queries");
+    outcome.ms = pair("ms");
     match (failed(old), failed(new)) {
         (true, true) => {
             outcome.verdict = "both-fail".into();

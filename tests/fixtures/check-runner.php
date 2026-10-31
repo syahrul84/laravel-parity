@@ -60,6 +60,30 @@ if (($rows['invalid']['json']['errors']['name'] ?? null) === null) {
     $failures[] = 'the 422 answer has no validation error for name';
 }
 
+// the other modes: list commands / jobs / schedule, run one command, ask the broadcast channels
+$modes = [
+    'console' => ['mode' => 'console'],
+    'console-run' => ['mode' => 'console-run', 'clock' => '2026-01-01 09:00:00', 'timeout' => 60, 'users' => new stdClass(),
+        'items' => [['id' => 'env', 'kind' => 'command', 'name' => 'env']]],
+    'channels' => ['mode' => 'channels', 'users' => new stdClass(), 'channels' => []],
+];
+foreach ($modes as $name => $job) {
+    $job['database'] = ['driver' => 'sqlite', 'database' => $sqlite];
+    file_put_contents("$dir/$name.json", json_encode($job));
+    @unlink("$dir/$name.jsonl");
+    passthru(sprintf('php %s --app=%s --job=%s --out=%s', escapeshellarg($runner), escapeshellarg($app), escapeshellarg("$dir/$name.json"), escapeshellarg("$dir/$name.jsonl")), $code);
+    $lines = array_map(fn ($l) => json_decode($l, true), file("$dir/$name.jsonl") ?: []);
+    $ok = match ($name) {
+        'console' => is_array($lines[0]['console']['commands'] ?? null) && is_array($lines[0]['console']['schedule'] ?? null),
+        'console-run' => ($lines[0]['status'] ?? null) === 0,
+        'channels' => is_array($lines[0]['channels']['answers'] ?? null),
+    };
+    echo "$name: ".($ok ? 'ok' : 'FAILED')."\n";
+    if (! $ok) {
+        $failures[] = "mode $name did not answer as expected (exit $code): ".json_encode($lines[0] ?? null);
+    }
+}
+
 if ($failures) {
     fwrite(STDERR, "\n".implode("\n", $failures)."\n");
     exit(1);
