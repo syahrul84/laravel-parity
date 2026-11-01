@@ -120,7 +120,7 @@ if (! $ok) {
 // the coverage reader (tests step): PHPUnit's --coverage-php files, merged and summed by php/coverage.php
 if (extension_loaded('pcov')) {
     $script = dirname(__DIR__, 2).'/php/coverage.php';
-    shell_exec(sprintf('cd %s && php -d pcov.enabled=1 -d pcov.directory=%s vendor/bin/phpunit --coverage-php %s tests/Unit 2>&1',
+    $phpunit = shell_exec(sprintf('cd %s && php -d pcov.enabled=1 -d pcov.directory=%s vendor/bin/phpunit --coverage-php %s tests/Unit 2>&1',
         escapeshellarg($app), escapeshellarg("$app/app"), escapeshellarg("$dir/own.cov")));
     @unlink("$dir/merged.cov");
     shell_exec(sprintf('php %s --app=%s merge %s %s 2>&1', escapeshellarg($script), escapeshellarg($app), escapeshellarg("$dir/merged.cov"), escapeshellarg("$dir/own.cov")));
@@ -130,7 +130,7 @@ if (extension_loaded('pcov')) {
         && is_array($summary['areas'] ?? null);
     echo 'coverage: '.($ok ? 'ok' : 'FAILED')."\n";
     if (! $ok) {
-        $failures[] = 'php/coverage.php did not read the coverage PHPUnit wrote: '.json_encode($summary);
+        $failures[] = 'php/coverage.php did not read the coverage PHPUnit wrote: '.json_encode($summary)."\nPHPUnit said:\n".$phpunit;
     }
 } else {
     echo "coverage: skipped (no pcov)\n";
