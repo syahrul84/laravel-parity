@@ -106,11 +106,43 @@ pub struct Tests {
     pub scope: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
     pub body: BTreeMap<String, String>,
+    /// measure the lines of app/ the tests cover (needs pcov or Xdebug in the new app's PHP); default on
+    pub coverage: Option<bool>,
+    /// "mirror" (default: next to the app's own tests, following app/) or "folder" (every feature test in `dir`)
+    pub layout: Option<String>,
+    /// the base class of generated unit tests (default Tests\TestCase)
+    pub unit_base_class: Option<String>,
+    /// the line coverage of app/ to reach; the report shows how far off it is
+    pub target: Option<f64>,
 }
 
 impl Tests {
     pub fn dir(&self) -> &str {
         self.dir.as_deref().unwrap_or("tests/Feature/Parity")
+    }
+
+    pub fn coverage(&self) -> bool {
+        self.coverage.unwrap_or(true)
+    }
+
+    /// Where the generated tests go, for messages.
+    pub fn place_text(&self) -> String {
+        if self.layout() == "folder" {
+            self.dir().to_string()
+        } else {
+            "tests/ (next to the app's own tests, following app/)".into()
+        }
+    }
+
+    pub fn layout(&self) -> &str {
+        match self.layout.as_deref() {
+            Some("folder") => "folder",
+            _ => "mirror",
+        }
+    }
+
+    pub fn target(&self) -> f64 {
+        self.target.unwrap_or(80.0)
     }
 }
 

@@ -66,6 +66,9 @@ $modes = [
     'console-run' => ['mode' => 'console-run', 'clock' => '2026-01-01 09:00:00', 'timeout' => 60, 'users' => new stdClass(),
         'items' => [['id' => 'env', 'kind' => 'command', 'name' => 'env']]],
     'channels' => ['mode' => 'channels', 'users' => new stdClass(), 'channels' => []],
+    'units' => ['mode' => 'units', 'skip' => ['Http/Controllers', 'Providers']],
+    'probe' => ['mode' => 'probe', 'clock' => '2026-01-01 09:00:00', 'timeout' => 30, 'users' => new stdClass(),
+        'items' => [['id' => 'code', 'class' => '', 'method' => '', 'code' => 'return ["sum" => 1 + 1, "now" => now()->toDateString()];']]],
 ];
 foreach ($modes as $name => $job) {
     $job['database'] = ['driver' => 'sqlite', 'database' => $sqlite];
@@ -77,6 +80,9 @@ foreach ($modes as $name => $job) {
         'console' => is_array($lines[0]['console']['commands'] ?? null) && is_array($lines[0]['console']['schedule'] ?? null),
         'console-run' => ($lines[0]['status'] ?? null) === 0,
         'channels' => is_array($lines[0]['channels']['answers'] ?? null),
+        'units' => in_array('App\\Models\\User', array_column($lines[0]['units'] ?? [], 'class'), true),
+        'probe' => ($lines[0]['status'] ?? null) === 'ok' && ($lines[0]['value'] ?? null) === ['sum' => 2, 'now' => '2026-01-01']
+            && ($lines[0]['keys'] ?? null) === ['sum', 'now'],
     };
     echo "$name: ".($ok ? 'ok' : 'FAILED')."\n";
     if (! $ok) {
@@ -109,6 +115,25 @@ $ok = ($recorded['route'] ?? null) === 'parity/units/{unit}' && ($recorded['valu
 echo 'recorder: '.($ok ? 'ok' : 'FAILED')."\n";
 if (! $ok) {
     $failures[] = 'the recorder middleware did not record the save as expected: '.json_encode($recorded);
+}
+
+// the coverage reader (tests step): PHPUnit's --coverage-php files, merged and summed by php/coverage.php
+if (extension_loaded('pcov')) {
+    $script = dirname(__DIR__, 2).'/php/coverage.php';
+    shell_exec(sprintf('cd %s && php -d pcov.enabled=1 -d pcov.directory=%s vendor/bin/phpunit --coverage-php %s tests/Unit 2>&1',
+        escapeshellarg($app), escapeshellarg("$app/app"), escapeshellarg("$dir/own.cov")));
+    @unlink("$dir/merged.cov");
+    shell_exec(sprintf('php %s --app=%s merge %s %s 2>&1', escapeshellarg($script), escapeshellarg($app), escapeshellarg("$dir/merged.cov"), escapeshellarg("$dir/own.cov")));
+    $summary = json_decode((string) shell_exec(sprintf('php %s --app=%s summary %s %s', escapeshellarg($script), escapeshellarg($app),
+        escapeshellarg("$dir/own.cov"), escapeshellarg("$dir/merged.cov"))), true);
+    $ok = ($summary['own']['lines'] ?? 0) > 0 && ($summary['with']['lines'] ?? 0) === $summary['own']['lines']
+        && is_array($summary['areas'] ?? null);
+    echo 'coverage: '.($ok ? 'ok' : 'FAILED')."\n";
+    if (! $ok) {
+        $failures[] = 'php/coverage.php did not read the coverage PHPUnit wrote: '.json_encode($summary);
+    }
+} else {
+    echo "coverage: skipped (no pcov)\n";
 }
 
 if ($failures) {

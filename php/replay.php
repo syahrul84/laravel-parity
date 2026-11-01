@@ -807,7 +807,427 @@ function parity_channels($app, array $job)
     );
 }
 
+/** The app's own classes under app/ (PSR-4 from composer.json), with their public methods and parameters. */
+function parity_units($appPath, array $job)
+{
+    $composer = json_decode((string) @file_get_contents("$appPath/composer.json"), true);
+    $roots = array();
+    foreach ((array) (isset($composer['autoload']['psr-4']) ? $composer['autoload']['psr-4'] : array()) as $prefix => $dirs) {
+        foreach ((array) $dirs as $dir) {
+            if (rtrim($dir, '/') === 'app') {
+                $roots[$prefix] = rtrim($dir, '/');
+            }
+        }
+    }
+    if (! $roots) {
+        $roots = array('App\\' => 'app');
+    }
+    $skip = isset($job['skip']) ? (array) $job['skip'] : array();
+    $units = array();
+    foreach ($roots as $prefix => $dir) {
+        if (! is_dir("$appPath/$dir")) {
+            continue;
+        }
+        $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator("$appPath/$dir", FilesystemIterator::SKIP_DOTS));
+        foreach ($files as $file) {
+            $path = $file->getPathname();
+            if (substr($path, -4) !== '.php') {
+                continue;
+            }
+            $relative = substr($path, strlen("$appPath/$dir/"), -4);
+            $class = $prefix.str_replace('/', '\\', $relative);
+            $folder = strpos($relative, '/') === false ? '' : substr($relative, 0, strrpos($relative, '/'));
+            $skipped = false;
+            foreach ($skip as $pattern) {
+                if ($folder === $pattern || strpos($folder.'/', $pattern.'/') === 0) {
+                    $skipped = true;
+                }
+            }
+            if ($skipped) {
+                continue;
+            }
+            // only a file that declares the class its path names: loading a copy (Report_old.php declaring Report)
+            // would declare a class twice, a fatal error nothing can catch
+            $code = (string) @file_get_contents($path);
+            $base = basename($relative);
+            $namespace = substr($class, 0, strrpos($class, '\\'));
+            if (! preg_match('/^\s*(?:abstract\s+|final\s+|readonly\s+)*class\s+'.preg_quote($base, '/').'\b/m', $code)
+                || ! preg_match('/^\s*namespace\s+'.preg_quote($namespace, '/').'\s*;/m', $code)) {
+                continue;
+            }
+            try {
+                if (! class_exists($class)) {
+                    continue;
+                }
+                $reflection = new ReflectionClass($class);
+            } catch (Throwable $e) {
+                continue;
+            }
+            if ($reflection->isAbstract() || $reflection->isInterface() || $reflection->isTrait()) {
+                continue;
+            }
+            $methods = array();
+            foreach ($reflection->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+                $name = $method->getName();
+                if ($method->getDeclaringClass()->getName() !== $class || strpos($name, '__') === 0 || $method->getFileName() === false) {
+                    continue;
+                }
+                if (strpos($method->getFileName(), "$appPath/vendor/") === 0) {
+                    continue;
+                }
+                $params = array();
+                foreach ($method->getParameters() as $param) {
+                    $params[] = parity_param($param);
+                }
+                $return = $method->getReturnType();
+                $methods[] = array(
+                    'name' => $name,
+                    'static' => $method->isStatic(),
+                    'line' => $method->getStartLine(),
+                    'end' => $method->getEndLine(),
+                    'params' => $params,
+                    'returns' => $return ? parity_type_name($return) : null,
+                );
+            }
+            $model = $reflection->isSubclassOf('Illuminate\Database\Eloquent\Model');
+            $units[] = array(
+                'class' => $class,
+                'file' => "$dir/$relative.php",
+                'kind' => $model ? 'model' : 'class',
+                'methods' => $methods,
+            );
+        }
+    }
+
+    return $units;
+}
+
+function parity_type_name($type)
+{
+    if ($type instanceof ReflectionNamedType) {
+        return ($type->allowsNull() && $type->getName() !== 'mixed' && $type->getName() !== 'null' ? '?' : '').$type->getName();
+    }
+
+    return (string) $type;
+}
+
+function parity_param(ReflectionParameter $param)
+{
+    $type = $param->getType();
+    $row = array(
+        'name' => $param->getName(),
+        'type' => $type ? parity_type_name($type) : null,
+        'optional' => $param->isOptional(),
+        'nullable' => $type ? $type->allowsNull() : true,
+        'variadic' => $param->isVariadic(),
+    );
+    if ($param->isDefaultValueAvailable()) {
+        try {
+            $row['default'] = parity_value($param->getDefaultValue(), 0);
+        } catch (Throwable $e) {
+        }
+    }
+
+    return $row;
+}
+
+/**
+ * Arguments for a constructor or method the way a unit test would build them: values the job gives, the newest row
+ * for a model, a request, now for a date, the container for other classes, the default, or null for a ?Type. Each
+ * comes with how it was made, so the generated test can make it the same way. ($args, $how, $why)
+ */
+function parity_args($app, $function, array $given)
+{
+    $args = array();
+    $how = array();
+    if (! $function) {
+        return array($args, $how, null);
+    }
+    foreach ($function->getParameters() as $param) {
+        $name = $param->getName();
+        $type = $param->getType();
+        $class = $type instanceof ReflectionNamedType && ! $type->isBuiltin() ? $type->getName() : null;
+        if ($param->isVariadic()) {
+            break;
+        }
+        if (array_key_exists($name, $given)) {
+            $value = $given[$name];
+            if ($class && is_subclass_of($class, 'Illuminate\Database\Eloquent\Model') && ! is_object($value)) {
+                $value = $class::find($value);
+                if (! $value) {
+                    return array(null, null, "no $class with id {$given[$name]}");
+                }
+            }
+            $args[] = $value;
+            $how[] = array('how' => 'given', 'value' => parity_value($given[$name], 0));
+        } elseif ($class && is_subclass_of($class, 'Illuminate\Database\Eloquent\Model')) {
+            $model = new $class();
+            $row = $class::query()->orderBy($model->getKeyName(), 'desc')->first();
+            if (! $row) {
+                if ($param->isOptional() || $param->allowsNull()) {
+                    $args[] = $param->isOptional() ? $param->getDefaultValue() : null;
+                    $how[] = array('how' => 'null');
+                    continue;
+                }
+
+                return array(null, null, 'no row in '.$model->getTable()." for \$$name");
+            }
+            $args[] = $row;
+            $how[] = array('how' => 'model', 'class' => $class);
+        } elseif ($class && ($class === 'Illuminate\Http\Request' || is_subclass_of($class, 'Illuminate\Http\Request'))) {
+            $args[] = $class::create('/', 'GET');
+            $how[] = array('how' => 'request', 'class' => $class);
+        } elseif ($class && ($class === 'DateTimeInterface' || is_subclass_of($class, 'DateTimeInterface') || $class === 'Carbon\Carbon' || $class === 'Illuminate\Support\Carbon')) {
+            $args[] = Illuminate\Support\Carbon::now();
+            $how[] = array('how' => 'now');
+        } elseif ($param->isOptional()) {
+            $args[] = $param->getDefaultValue();
+            $how[] = array('how' => 'default', 'value' => parity_value($param->getDefaultValue(), 0));
+        } elseif ($class && $class !== 'Closure') {
+            try {
+                $args[] = $app->make($class);
+                $how[] = array('how' => 'make', 'class' => $class);
+            } catch (Throwable $e) {
+                if ($param->allowsNull()) {
+                    $args[] = null;
+                    $how[] = array('how' => 'null');
+                } else {
+                    return array(null, null, "needs \$$name ($class)");
+                }
+            }
+        } elseif ($type && $param->allowsNull()) {
+            $args[] = null;
+            $how[] = array('how' => 'null');
+        } else {
+            return array(null, null, "needs \$$name".($type ? ' ('.parity_type_name($type).')' : ''));
+        }
+    }
+
+    return array($args, $how, null);
+}
+
+/** What a method gave back: its type, a JSON copy, and the keys or the related class a test can check. */
+function parity_result($value)
+{
+    $row = array('type' => is_object($value) ? get_class($value) : gettype($value));
+    if ($value instanceof Illuminate\Database\Eloquent\Relations\Relation) {
+        $row['related'] = get_class($value->getRelated());
+        try {
+            $row['count'] = $value->count();
+        } catch (Throwable $e) {
+            $row['count'] = 'error: '.get_class($e);
+        }
+
+        return $row;
+    }
+    if ($value instanceof Illuminate\Database\Eloquent\Builder || $value instanceof Illuminate\Database\Query\Builder) {
+        try {
+            $row['count'] = $value->count();
+        } catch (Throwable $e) {
+            $row['count'] = 'error: '.get_class($e);
+        }
+
+        return $row;
+    }
+    $copy = parity_value($value, 0);
+    $row['value'] = $copy;
+    if (is_array($copy)) {
+        $keys = array();
+        foreach (array_keys($copy) as $key) {
+            if (is_string($key)) {
+                $keys[] = $key;
+            }
+        }
+        $row['keys'] = $keys;
+    }
+
+    return $row;
+}
+
+/** A model's own settings, the same on every row: what the upgrade's $dates -> $casts and similar moves change. */
+function parity_model_config($model)
+{
+    $casts = $model->getCasts();
+    if (method_exists($model, 'getDates')) {
+        foreach ($model->getDates() as $date) {
+            if (! isset($casts[$date])) {
+                $casts[$date] = 'datetime';
+            }
+        }
+    }
+    ksort($casts);
+    $fillable = $model->getFillable();
+    sort($fillable);
+    $hidden = $model->getHidden();
+    sort($hidden);
+
+    return array(
+        'table' => $model->getTable(),
+        'key' => $model->getKeyName(),
+        'fillable' => $fillable,
+        'hidden' => $hidden,
+        'casts' => $casts,
+    );
+}
+
+/** One method of one class, on the newest row for a model; rolled back with everything leaving the app faked. */
+function parity_probe($app, $appPath, array $job, array $item)
+{
+    $row = array('id' => $item['id']);
+    $class = $item['class'];
+    $method = $item['method'];
+    $given = isset($item['args']) ? (array) $item['args'] : array();
+    parity_record($app, $job);
+    $connection = $app['db']->connection();
+    $connection->beginTransaction();
+    $started = microtime(true);
+    $level = ob_get_level();
+    ob_start();
+    try {
+        if (isset($item['code'])) {
+            $function = eval('return function ($app) { '.$item['code'].' };');
+            $row += array('status' => 'ok') + parity_result($function($app));
+        } else {
+            $reflection = new ReflectionClass($class);
+            $model = $reflection->isSubclassOf('Illuminate\Database\Eloquent\Model');
+            $instance = null;
+            if ($model) {
+                $blank = new $class();
+                $instance = $class::query()->orderBy($blank->getKeyName(), 'desc')->first();
+                $row['instance'] = $instance ? 'newest' : 'new';
+                if (! $instance) {
+                    $instance = $blank;
+                }
+            } elseif ($method !== '@config' && $reflection->getMethod($method)->isStatic()) {
+                $row['static'] = true;
+            } elseif ($method !== '@config') {
+                list($args, $how, $why) = parity_args($app, $reflection->getConstructor(), isset($item['construct']) ? (array) $item['construct'] : array());
+                if ($why !== null) {
+                    $row['status'] = 'not-run';
+                    $row['error'] = $why;
+                } else {
+                    $row['construct'] = $how;
+                    $instance = $reflection->newInstanceArgs($args);
+                }
+            }
+            if (! isset($row['status'])) {
+                if ($method === '@config') {
+                    $row += array('status' => 'ok', 'type' => 'config', 'value' => parity_model_config($instance));
+                } elseif ($model && strpos($method, 'scope') === 0 && strlen($method) > 5) {
+                    // a scope runs through the query builder, without its first ($query) parameter
+                    $function = new ReflectionMethod($class, $method);
+                    $params = $function->getParameters();
+                    array_shift($params);
+                    list($args, $how, $why) = parity_args_list($app, $params, $given);
+                    if ($why !== null) {
+                        $row += array('status' => 'not-run', 'error' => $why);
+                    } else {
+                        $row['args'] = $how;
+                        $query = call_user_func_array(array($class::query(), lcfirst(substr($method, 5))), $args);
+                        $row += array('status' => 'ok') + parity_result($query);
+                    }
+                } elseif ($model && preg_match('/^get(\w+)Attribute$/', $method, $m) && $m[1] !== '') {
+                    $attribute = Illuminate\Support\Str::snake($m[1]);
+                    $row['attribute'] = $attribute;
+                    $row += array('status' => 'ok') + parity_result($instance->getAttribute($attribute));
+                } elseif ($model && preg_match('/^set\w+Attribute$/', $method)) {
+                    $row += array('status' => 'not-run', 'error' => 'a mutator runs when the attribute is saved');
+                } else {
+                    $function = new ReflectionMethod($class, $method);
+                    list($args, $how, $why) = parity_args($app, $function, $given);
+                    if ($why !== null) {
+                        $row += array('status' => 'not-run', 'error' => $why);
+                    } else {
+                        $row['args'] = $how;
+                        $result = $function->isStatic() ? $function->invokeArgs(null, $args) : $function->invokeArgs($instance, $args);
+                        $row += array('status' => 'ok') + parity_result($result);
+                    }
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        $row['status'] = 'threw';
+        $row['error'] = get_class($e).': '.substr($e->getMessage(), 0, 400);
+        $file = $e->getFile();
+        $row['file'] = (strpos($file, $appPath.'/') === 0 ? substr($file, strlen($appPath) + 1) : $file).':'.$e->getLine();
+    }
+    while (ob_get_level() > $level) {
+        ob_end_clean();
+    }
+    $row['ms'] = (int) round((microtime(true) - $started) * 1000);
+    while ($connection->transactionLevel() > 0) {
+        $connection->rollBack();
+    }
+    $row['queries'] = ParityRecorder::$queries;
+    $row['effects'] = parity_effects($app, ParityRecorder::$writes, ParityRecorder::$logs);
+    foreach (array('Illuminate\Support\Carbon', 'Carbon\Carbon', 'Carbon\CarbonImmutable') as $carbon) {
+        if (class_exists($carbon)) {
+            $carbon::setTestNow();
+        }
+    }
+
+    return $row;
+}
+
+/** parity_args for a list of parameters (a scope without its $query). */
+function parity_args_list($app, array $params, array $given)
+{
+    $fake = new ParityParams($params);
+
+    return parity_args($app, $fake, $given);
+}
+
+/** Stands in for a ReflectionFunctionAbstract where only getParameters() is read. */
+class ParityParams
+{
+    private $params;
+
+    public function __construct(array $params)
+    {
+        $this->params = $params;
+    }
+
+    public function getParameters()
+    {
+        return $this->params;
+    }
+}
+
 $mode = isset($job['mode']) ? $job['mode'] : 'replay';
+
+if ($mode === 'units') {
+    list($app, $kernel) = parity_boot($appPath, $job, true);
+    parity_emit($out, array('info' => parity_info($app), 'units' => parity_units($appPath, $job)));
+    exit(0);
+}
+
+if ($mode === 'probe') {
+    // one app for the whole batch; each method runs in its own rolled-back transaction
+    $seconds = isset($job['timeout']) ? (int) $job['timeout'] : 30;
+    list($app, $kernel) = parity_boot($appPath, $job, true);
+    foreach ((array) $job['items'] as $item) {
+        if (function_exists('pcntl_async_signals') && function_exists('pcntl_alarm')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGALRM, function () use ($out, $item, $seconds) {
+                parity_emit($out, array('id' => $item['id'], 'status' => 'timeout', 'error' => "still running after {$seconds}s"));
+                exit(75);
+            });
+            pcntl_alarm($seconds);
+        }
+        try {
+            parity_emit($out, parity_probe($app, $appPath, $job, $item));
+        } catch (Throwable $e) {
+            parity_emit($out, array('id' => $item['id'], 'status' => 'runner-error', 'error' => get_class($e).': '.$e->getMessage()));
+        }
+        if (function_exists('pcntl_alarm')) {
+            pcntl_alarm(0);
+        }
+        if (headers_sent()) {
+            exit(75);
+        }
+    }
+    exit(0);
+}
 
 if ($mode === 'artisan') {
     list($app, $kernel) = parity_boot($appPath, $job, true);

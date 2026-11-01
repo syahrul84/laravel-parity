@@ -51,7 +51,18 @@ Docker is optional. Nothing is written to your real database. Built on
 - **`report.md`**: every route and case, old answer vs new answer. Both files start with **since the last run**: what
   your fixes fixed and what broke since
 - **PHPUnit tests** in the new repo for routes without one: one test per route with a data provider of its cases
-  (happy path, not signed in, missing record, empty and incomplete bodies), each expecting what the old app did
+  (happy path, not signed in, missing record, empty and incomplete bodies), each expecting what the old app did.
+  It shows how much they add: routes with a test before and after, and the **lines of `app/` covered** by the app's
+  own tests and with the generated ones, per area (needs pcov or Xdebug in the new app's PHP; the app's own suite is
+  measured once and reused until its code or tests change; `[tests] coverage = false` turns it off)
+- **Every method of the app's own classes** run on both apps (`units`): models (relations, scopes, accessors, and
+  their table, fillable, hidden and casts), services, exports, notifications, helpers. What now throws or returns
+  something else goes in the fix list; what the old app returned becomes a **unit test** next to the app's own
+  (`tests/Unit/Models/UnitParityTest.php` for `app/Models/Unit.php`; feature tests follow the controllers the same
+  way; `[tests] layout = "folder"` keeps them in one folder)
+- A **coverage target** (`[tests] target`, default 80%): `gaps` lists the methods with the most lines no test runs and
+  where their test belongs; an AI assistant on the MCP server writes those tests (`coverage_gaps`, `probe_code` to see
+  what the old app does, `check_tests`) until the target is met
 - For AI assistants: an **MCP server**, so Claude Code (or any MCP client) can run it, read the fix list, look at one
   route's old and new answer side by side, fix the code and re-check just that route
 
@@ -128,7 +139,11 @@ laravel-parity all pairs/shop.toml                     # everything; then open r
 | `run` | every request on both apps; writes `report.md` and `fixes.md` (`--only "api/orders"` re-runs just those) |
 | `console` | the app's commands and queued jobs, run on both apps (time-limited, rolled back), and the schedule |
 | `channels` | who may join each broadcast channel on both apps, /broadcasting/auth, the driver (after `run`) |
-| `tests` | PHPUnit tests for routes without one, run in the new app |
+| `units` | Every public method of the app's own classes on both apps (`--only <Class>`) |
+| `tests` | PHPUnit tests next to the app's own: routes without one, and the classes from `units`; runs them with coverage |
+| `gaps` | The methods with the most lines no test runs, and where their test belongs |
+| `check-tests` | Run test files you wrote with coverage: pass/fail and the coverage now |
+| `probe` | Run a few lines of PHP on both apps and compare what they return |
 | `import-log` | real requests as extra cases: an nginx / Apache access log, or the recorder's file of real saves |
 | `recorder` | a middleware for a test or staging copy of the old app that records real saves with their bodies |
 | `learn` | fill the fields the old app's validation errors ask for and send again (`run` does this itself) |

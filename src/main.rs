@@ -6,6 +6,7 @@ mod codemap;
 mod compare;
 mod config;
 mod console;
+mod coverage;
 mod db;
 mod fixlist;
 mod gate;
@@ -13,6 +14,7 @@ mod glob;
 mod guide;
 mod history;
 mod init;
+mod layout;
 mod learn;
 mod log;
 mod logs;
@@ -26,6 +28,7 @@ mod rules;
 mod runner;
 mod schema;
 mod testgen;
+mod units;
 mod update;
 mod web;
 
@@ -102,6 +105,26 @@ enum Command {
     Console { pair: PathBuf },
     /// Who may join each broadcast channel (Echo / Reverb), the /broadcasting/auth route and the driver
     Channels { pair: PathBuf },
+    /// Every public method of the app's own classes (models, services, exports ...) on both apps: what differs
+    Units {
+        pair: PathBuf,
+        /// Only classes whose name contains this text; keeps the others' results
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// The methods of app/ with the most lines no test runs, and where a test for each belongs
+    Gaps {
+        pair: PathBuf,
+        /// Only files whose path contains this (Models, Services/Billing ...)
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Run test files you wrote (group laravel-parity-ai) with coverage: pass/fail and the coverage now
+    CheckTests { pair: PathBuf, files: Vec<String> },
+    /// Run a few lines of PHP on both apps (rolled back, faked) and show what each returned
+    Probe { pair: PathBuf, code: String },
     /// Fill the fields the old app's validation errors name and send those requests again (run does this itself)
     Learn {
         pair: PathBuf,
@@ -145,7 +168,7 @@ enum Command {
     },
     /// Rewrite the report from the last run
     Report { pair: PathBuf },
-    /// Generate PHPUnit tests for shared routes that have none
+    /// Generate PHPUnit tests for shared routes that have none, run them and show the coverage they add
     Tests {
         pair: PathBuf,
         /// Do not run the generated tests
@@ -245,6 +268,42 @@ fn main() {
                 })
                 .map(drop)
         }
+        Command::Units { pair, only } => {
+            let config = load(&pair);
+            units::check(&config, only.as_deref())
+                .and_then(|line| {
+                    say(&line);
+                    ops::report(&config)
+                })
+                .map(drop)
+        }
+        Command::Gaps {
+            pair,
+            filter,
+            limit,
+        } => coverage::gaps(&load(&pair), filter.as_deref(), limit).map(|found| {
+            say(&format!(
+                "{} methods have lines no test runs; the largest gaps:",
+                found["total"]
+            ));
+            for g in found["gaps"].as_array().into_iter().flatten() {
+                say(&format!(
+                    "  {}::{}  {}:{}  {} of {} lines missed ({})\n      test: {}",
+                    g["class"].as_str().unwrap_or_default(),
+                    g["method"].as_str().unwrap_or_default(),
+                    g["file"].as_str().unwrap_or_default(),
+                    g["line"],
+                    g["missed"],
+                    g["lines"],
+                    g["missed_lines"].as_str().unwrap_or_default(),
+                    g["test_file"].as_str().unwrap_or_default()
+                ));
+            }
+        }),
+        Command::CheckTests { pair, files } => coverage::check_tests(&load(&pair), &files)
+            .map(|v| say(&serde_json::to_string_pretty(&v).unwrap_or_default())),
+        Command::Probe { pair, code } => units::probe_code(&load(&pair), &code)
+            .map(|v| say(&serde_json::to_string_pretty(&v).unwrap_or_default())),
         Command::Recorder { pair } => logs::recorder(&load(&pair)).map(drop),
         Command::Overview => history::overview().map(drop),
         Command::Baseline { pair, file } => {

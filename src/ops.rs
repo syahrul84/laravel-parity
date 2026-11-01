@@ -713,12 +713,91 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         generated.files.len(),
         generated.cannot.len()
     ));
+    // unit tests: the app's own classes, method by method, as the old app answered
+    if crate::units::last(config).is_none() {
+        say(
+            "Running the app's classes method by method on both apps (once; `laravel-parity units` runs it again) ...",
+        );
+        say(&crate::units::check(config, None)?);
+    }
+    let mut unit = crate::units::generate(config, &HashSet::new());
+    say(&format!(
+        "Generated {} unit tests in {} files; {} methods could not get one.",
+        unit.made.len(),
+        unit.files.len(),
+        unit.cannot.len()
+    ));
 
     let mut outcome = HashMap::new();
+    let mut coverage = Value::Null;
     if verify && !generated.files.is_empty() {
         runner::ensure_ready(&config.new)?;
+        // coverage: the app's own tests (measured once, reused until they or the code change), then the generated
+        // ones while they run anyway
+        let mut cover = None;
+        let mut own = None;
+        if config.tests.coverage() {
+            match crate::coverage::driver(&config.new) {
+                None => {
+                    coverage = json!({"note": crate::coverage::missing_note()});
+                    say(&format!(
+                        "Code coverage {}.",
+                        crate::coverage::missing_note()
+                    ));
+                }
+                Some(driver) => match crate::coverage::script(&config.new) {
+                    Ok(script) => {
+                        own = Some(crate::coverage::own(
+                            config,
+                            driver,
+                            testgen::phpunit_attributes(&config.new.repo),
+                        ));
+                        cover = Some((driver, script));
+                    }
+                    Err(e) => coverage = json!({"note": format!("not measured: {e}")}),
+                },
+            }
+        }
         say("Running the generated tests with the new app's PHP ...");
-        outcome = testgen::run_phpunit(config, &generated.files);
+        let (ran, generated_cov) = testgen::run_phpunit(
+            config,
+            &[generated.files.clone(), unit.files.clone()].concat(),
+            cover.as_ref().map(|(d, s)| (*d, s.as_str())),
+        );
+        outcome = ran;
+        if let Some((driver, script)) = &cover {
+            let own = own.unwrap_or(crate::coverage::Own {
+                file: None,
+                reused: false,
+                note: None,
+            });
+            let ai = crate::coverage::ai_tests(config, *driver, script);
+            let mut extra: Vec<&std::path::Path> =
+                generated_cov.iter().map(|p| p.as_path()).collect();
+            if let Some(file) = &ai.file {
+                extra.push(file);
+            }
+            coverage = match crate::coverage::summary(config, script, own.file.as_deref(), &extra) {
+                Ok(mut summary) => {
+                    summary["driver"] = json!(driver.name());
+                    summary["own_reused"] = json!(own.reused);
+                    summary["ai_tests"] = json!({"passed": ai.passed, "failed": ai.failed});
+                    summary["target"] = json!(config.tests.target());
+                    if let Some(note) = &own.note {
+                        summary["own_note"] = json!(note);
+                    }
+                    summary
+                }
+                Err(e) => json!({"note": format!("not measured: {e}")}),
+            };
+            runner::remove(&config.new, script);
+            if let Some(line) = crate::coverage::line(&coverage) {
+                say(&line);
+            }
+            if let Some(note) = &own.note {
+                say(&format!("Coverage: {note}"));
+            }
+        }
         let failing: HashSet<(String, String)> = outcome
             .iter()
             .filter(|(_, v)| v.is_some())
@@ -731,6 +810,7 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         ));
         if drop_failing && !failing.is_empty() {
             generated = testgen::generate(config, &specs, &old_rows, &untested, &tables, &failing);
+            unit = crate::units::generate(config, &failing);
             say(&format!(
                 "Removed the {} failing tests from the files; they are listed in tests.md.",
                 failing.len()
@@ -738,9 +818,17 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         }
     }
 
+    let stale = crate::layout::remove_stale(config, crate::layout::Kind::Feature, &generated.files)
+        + crate::layout::remove_stale(config, crate::layout::Kind::Unit, &unit.files);
+    if stale > 0 {
+        say(&format!(
+            "Removed {stale} generated test files that were not written again (moved, or their route has a test now)."
+        ));
+    }
     let key_of: HashMap<(String, String), String> = generated
         .made
         .iter()
+        .chain(unit.made.iter())
         .map(|m| ((m.class.clone(), m.method.clone()), m.key.clone()))
         .collect();
     let mut failed: Vec<(&(String, String), &String)> = outcome
@@ -749,6 +837,52 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         .collect();
     failed.sort();
     let mut lines = vec!["# Generated tests".to_string(), String::new()];
+    // route coverage: routes some test reaches, before and after the generated ones
+    let tested_before = routes.len() - untested.len();
+    let given: BTreeSet<&str> = generated.made.iter().map(|m| m.key.as_str()).collect();
+    let tested_after = tested_before + given.len();
+    let share = |n: usize| {
+        if routes.is_empty() {
+            0.0
+        } else {
+            (n as f64 * 1000.0 / routes.len() as f64).round() / 10.0
+        }
+    };
+    lines.push(format!(
+        "Routes with a test: {tested_before} of {} ({}%) before, {tested_after} ({}%) with the generated tests.",
+        routes.len(),
+        share(tested_before),
+        share(tested_after)
+    ));
+    if let Some(line) = crate::coverage::line(&coverage) {
+        lines.push(String::new());
+        lines.push(line);
+        let gains = crate::coverage::gains(&coverage, 10);
+        if !gains.is_empty() {
+            lines.push(String::new());
+            lines.push("| Area of app/ | Lines | Own tests | With the generated ones |".into());
+            lines.push("|---|---:|---:|---:|".into());
+            for area in &gains {
+                let pct = |key: &str| {
+                    crate::coverage::percent(&json!({"lines": area["lines"], "covered": area[key]}))
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "?".into())
+                };
+                lines.push(format!(
+                    "| {} | {} | {} | {} |",
+                    area["area"].as_str().unwrap_or_default(),
+                    area["lines"],
+                    pct("own"),
+                    pct("with")
+                ));
+            }
+        }
+        if let Some(note) = coverage["own_note"].as_str() {
+            lines.push(String::new());
+            lines.push(format!("The app's own tests: {note}."));
+        }
+    }
+    lines.push(String::new());
     let mut failing_json = vec![];
     if !failed.is_empty() {
         lines.push("## Failing (a real difference, or a guess the generator got wrong)".into());
@@ -765,6 +899,7 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         lines.push(String::new());
     }
     let mut cannot = generated.cannot.clone();
+    cannot.extend(unit.cannot.iter().cloned());
     cannot.sort();
     if !cannot.is_empty() {
         lines.push("## Could not be generated (test these by hand)".into());
@@ -775,12 +910,15 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
     let ran = !outcome.is_empty();
     let summary = json!({
         "untested": untested.len(),
-        "generated": generated.made.len(),
-        "files": generated.files.len(),
+        "generated": generated.made.len() + unit.made.len(),
+        "files": generated.files.len() + unit.files.len(),
+        "unit": {"generated": unit.made.len(), "files": unit.files.len(), "cannot": unit.cannot.len()},
         "cannot": cannot.len(),
-        "dir": config.tests.dir(),
+        "dir": config.tests.place_text(),
         "passed": if ran { json!(outcome.len() - failed.len()) } else { json!("?") },
         "failed": if ran { json!(failed.len()) } else { json!("?") },
+        "routes": {"shared": routes.len(), "tested_before": tested_before, "tested_after": tested_after},
+        "coverage": coverage,
     });
     write(&config.work.join("tests.json"), &summary)?;
     write(
@@ -793,13 +931,16 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
     ));
     report(config)?;
     Ok(format!(
-        "{} untested routes; {} tests generated in {}, {} pass, {} fail; {} routes could not get a test",
+        "{} untested routes; {} tests generated in {}, {} pass, {} fail; {} routes could not get a test{}",
         untested.len(),
         generated.made.len(),
-        config.tests.dir(),
+        config.tests.place_text(),
         summary["passed"],
         summary["failed"],
-        cannot.len()
+        cannot.len(),
+        crate::coverage::line(&coverage)
+            .map(|l| format!(". {}", l.trim_end_matches('.')))
+            .unwrap_or_default()
     ))
 }
 

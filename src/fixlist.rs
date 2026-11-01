@@ -668,6 +668,7 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
     // the database, commands / jobs / schedule and broadcast channels (their own steps), and speed
     fixes.extend(crate::schema::fixes(config));
     fixes.extend(crate::console::fixes(config));
+    fixes.extend(crate::units::fixes(config));
     fixes.extend(crate::channels::fixes(config));
     fixes.extend(speed(&results));
 

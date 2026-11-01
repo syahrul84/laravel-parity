@@ -321,6 +321,36 @@ pub fn fetch(side: &Side, remote: &str, local: &Path) -> bool {
     }
 }
 
+/// Copy a file from this machine to the app's scratch folder; returns the path the app's PHP sees.
+pub fn put(side: &Side, local: &Path, name: &str) -> Result<String, String> {
+    let remote = scratch(side, name);
+    match &side.php {
+        Php::Docker { container } => {
+            checked(
+                docker(&["cp", &path_str(local), &format!("{container}:{remote}")])?,
+                "docker cp",
+            )?;
+        }
+        Php::Local { .. } => {
+            std::fs::copy(local, Path::new(&side.app_path).join(&remote))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(remote)
+}
+
+/// Remove a scratch file.
+pub fn remove(side: &Side, remote: &str) {
+    match &side.php {
+        Php::Docker { container } => {
+            let _ = docker(&["exec", container, "rm", "-f", remote]);
+        }
+        Php::Local { .. } => {
+            let _ = std::fs::remove_file(Path::new(&side.app_path).join(remote));
+        }
+    }
+}
+
 /// Where a scratch file goes, as the app's PHP sees it.
 pub fn scratch(side: &Side, name: &str) -> String {
     match side.php {

@@ -89,6 +89,22 @@ pub fn write(
             t["failed"],
             t["cannot"]
         );
+        if let (Some(shared), Some(before), Some(after)) = (
+            t["routes"]["shared"].as_u64().filter(|n| *n > 0),
+            t["routes"]["tested_before"].as_u64(),
+            t["routes"]["tested_after"].as_u64(),
+        ) {
+            let share = |n: u64| (n as f64 * 1000.0 / shared as f64).round() / 10.0;
+            let _ = writeln!(
+                out,
+                "Routes with a test: {before} of {shared} ({}%) before, {after} ({}%) with the generated tests.",
+                share(before),
+                share(after)
+            );
+        }
+        if let Some(line) = crate::coverage::line(&t["coverage"]) {
+            let _ = writeln!(out, "{line}");
+        }
     }
 
     for (name, label) in VERDICTS {

@@ -12,8 +12,10 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::coverage::{self, Driver};
 use crate::db::TableInfo;
 use crate::glob;
+use crate::layout::{self, Kind, Place};
 use crate::plan::{PARAM, Spec, plurals, snake};
 use crate::runner;
 
@@ -21,6 +23,13 @@ use crate::runner;
 static NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\W").unwrap());
 
 pub const MARKER: &str = "@generated laravel-parity";
+/// The PHPUnit group every generated class is in, so the app's own tests can run without them (`--exclude-group`).
+pub const GROUP: &str = "laravel-parity";
+/// The group of tests an AI assistant writes from the coverage gaps: not the app's own (measured with the generated
+/// ones), never overwritten by the tool.
+pub const AI_GROUP: &str = "laravel-parity-ai";
+/// Generated test files per PHPUnit run when the run of the whole group dies.
+const BATCH: usize = 100;
 const TESTABLE: [i64; 10] = [200, 201, 202, 204, 400, 401, 403, 404, 409, 422];
 
 struct ClassInfo {
@@ -189,11 +198,11 @@ fn php_shape(shape: &[Shape]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-fn php_string(value: &str) -> String {
+pub fn php_string(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn php_value(value: &Value) -> String {
+pub fn php_value(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),
         Value::Bool(b) => b.to_string(),
@@ -493,6 +502,17 @@ fn json_id(id: &str) -> Value {
         .unwrap_or_else(|_| Value::from(id))
 }
 
+/// The controller's full class name (App\\Http\\Controllers\\X), or Closure.
+fn controller_fqcn(action: Option<&str>) -> String {
+    match action.map(|a| a.split('@').next().unwrap_or(a).trim_start_matches('\\')) {
+        Some(class) if !class.is_empty() && class.chars().any(char::is_alphanumeric) => {
+            class.to_string()
+        }
+        _ => "Closure".into(),
+    }
+}
+
+#[cfg(test)]
 fn controller_class(action: Option<&str>) -> String {
     let Some(action) = action else {
         return "Closure".into();
@@ -515,12 +535,14 @@ fn controller_class(action: Option<&str>) -> String {
     }
 }
 
-fn render_file(config: &Config, controller: &str, methods: &[(String, String, String)]) -> String {
+fn render_file(
+    config: &Config,
+    place: &Place,
+    methods: &[(String, String, String)],
+    attribute: bool,
+) -> String {
     let tests = &config.tests;
-    let namespace = tests
-        .namespace
-        .as_deref()
-        .unwrap_or("Tests\\Feature\\Parity");
+    let namespace = &place.namespace;
     let base = tests
         .base_class
         .as_deref()
@@ -542,10 +564,19 @@ fn render_file(config: &Config, controller: &str, methods: &[(String, String, St
         " * holds the ways the route was sent (happy, not signed in, missing record, empty or incomplete body) and the".into(),
         " * status, JSON keys or validation errors the old app gave. Regenerating replaces this file; once you edit it,".into(),
         " * remove this marker so the tool leaves it alone.".into(),
-        " */".into(),
-        format!("class {controller}ParityTest extends \\{base}"),
-        "{".into(),
     ];
+    if attribute {
+        out.push(" */".into());
+        out.push(format!(
+            "#[\\PHPUnit\\Framework\\Attributes\\Group('{GROUP}')]"
+        ));
+    } else {
+        out.push(" *".into());
+        out.push(format!(" * @group {GROUP}"));
+        out.push(" */".into());
+    }
+    out.push(format!("class {} extends \\{base}", place.class));
+    out.push("{".into());
     for (i, (_, key, body)) in methods.iter().enumerate() {
         if i > 0 {
             out.push(String::new());
@@ -564,7 +595,12 @@ fn render_file(config: &Config, controller: &str, methods: &[(String, String, St
 }
 
 /// PHPUnit 10+ reads data providers from attributes; 9 from @dataProvider.
-fn phpunit_attributes(repo: &Path) -> bool {
+pub fn phpunit_attributes(repo: &Path) -> bool {
+    phpunit_major(repo).is_some_and(|m| m >= 10)
+}
+
+/// The PHPUnit major version in the repo's composer.lock.
+pub fn phpunit_major(repo: &Path) -> Option<u32> {
     let lock: Value = std::fs::read_to_string(repo.join("composer.lock"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -580,7 +616,6 @@ fn phpunit_attributes(repo: &Path) -> bool {
         .split('.')
         .next()
         .and_then(|m| m.parse::<u32>().ok())
-        .is_some_and(|m| m >= 10)
 }
 
 pub struct Made {
@@ -608,7 +643,6 @@ pub fn generate(
 ) -> Generated {
     let models = Models::read(&config.new.repo);
     let attribute = phpunit_attributes(&config.new.repo);
-    let target = config.new.repo.join(config.tests.dir());
     let mut routes: BTreeMap<&str, Vec<&Spec>> = BTreeMap::new();
     for spec in specs.iter().filter(|s| untested.contains(&s.key)) {
         routes.entry(spec.key.as_str()).or_default().push(spec);
@@ -616,20 +650,30 @@ pub fn generate(
     let mut by_controller: BTreeMap<String, Vec<(String, Vec<&Spec>)>> = BTreeMap::new();
     for (key, cases) in routes {
         by_controller
-            .entry(controller_class(cases[0].action.as_deref()))
+            .entry(controller_fqcn(cases[0].action.as_deref()))
             .or_default()
             .push((key.to_string(), cases));
     }
 
-    let _ = std::fs::create_dir_all(&target);
     let mut generated = Generated {
         files: vec![],
         made: vec![],
         cannot: vec![],
     };
+    let mut used = HashSet::new();
     for (controller, entries) in by_controller {
-        let class = format!("{controller}ParityTest");
-        let file = target.join(format!("{class}.php"));
+        let mut place = layout::place(config, Kind::Feature, &controller);
+        // two controllers with the same name in one folder (the folder layout): the second gets a number
+        let mut n = 1;
+        while !used.insert(place.file.clone()) {
+            n += 1;
+            let base = layout::place(config, Kind::Feature, &controller);
+            place.class = format!("{}{n}", base.class);
+            place.file = base.file.with_file_name(format!("{}.php", place.class));
+        }
+        let class = place.fqcn();
+        let file = place.file.clone();
+        let file_name = format!("{}.php", place.class);
         if file.exists()
             && !std::fs::read_to_string(&file)
                 .unwrap_or_default()
@@ -638,7 +682,7 @@ pub fn generate(
             generated.cannot.extend(
                 entries
                     .into_iter()
-                    .map(|(k, _)| (k, format!("{class}.php was edited by hand (no marker)"))),
+                    .map(|(k, _)| (k, format!("{file_name} was edited by hand (no marker)"))),
             );
             continue;
         }
@@ -669,58 +713,128 @@ pub fn generate(
             let _ = std::fs::remove_file(&file);
             continue;
         }
-        let _ = std::fs::write(&file, render_file(config, &controller, &methods));
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&file, render_file(config, &place, &methods, attribute));
         generated.files.push(file);
     }
     generated
 }
 
-/// (class, method) -> failure message, or None when it passed. The whole folder in one PHPUnit run; only if that
-/// dies without a report, one run per file, so a fatal error in one file cannot hide the rest.
+/// (class, method) -> failure message, or None when it passed.
+pub type Outcomes = HashMap<(String, String), Option<String>>;
+
+/// Runs the generated tests: the whole folder in one PHPUnit run; only if that
+/// dies without a report, one run per file, so a fatal error in one file cannot hide the rest. With a coverage
+/// driver and the path of coverage.php in the app (`cover`), also the coverage of all the generated tests
+/// (runs/<name>/coverage/generated.cov).
 pub fn run_phpunit(
     config: &Config,
     files: &[PathBuf],
-) -> HashMap<(String, String), Option<String>> {
+    cover: Option<(Driver, &str)>,
+) -> (Outcomes, Option<PathBuf>) {
     let mut results = HashMap::new();
     if files.is_empty() {
-        return results;
+        return (results, None);
     }
     let side = &config.new;
     runner::prepare_scratch(side);
-    let dir = config.tests.dir().to_string();
-    if phpunit(config, &dir, &mut results)
-        && files.iter().all(|f| {
-            let stem = f.file_stem().unwrap().to_string_lossy();
-            results.keys().any(|(c, _)| *c == stem)
-        })
-    {
-        return results;
+    let total = runner::scratch(side, "generated.cov");
+    runner::remove(side, &total);
+    // one test that kills PHP (exit, a fatal error) loses the whole run: run batches, and split a batch that gets
+    // no report in two until the file that does it runs alone
+    let mut queue: Vec<&[PathBuf]> = files.chunks(BATCH).rev().collect();
+    let mut parts = vec![];
+    let mut done = 0;
+    while let Some(batch) = queue.pop() {
+        let part = runner::scratch(side, &format!("part-{}.cov", parts.len()));
+        let cover_part = cover.map(|(driver, _)| (driver, part.as_str()));
+        let classes: Vec<String> = batch.iter().filter_map(|f| file_class(f)).collect();
+        let ran = if batch.len() == 1 || classes.len() < batch.len() {
+            batch.iter().all(|file| {
+                let rel = file
+                    .strip_prefix(&side.repo)
+                    .unwrap_or(file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                phpunit(config, &[&rel], &mut results, cover_part)
+            })
+        } else {
+            let filter = format!(
+                "(?:{})::",
+                classes
+                    .iter()
+                    .map(|c| c.replace('\\', "\\\\"))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            );
+            phpunit(
+                config,
+                &["--group", GROUP, "--filter", &filter],
+                &mut results,
+                cover_part,
+            ) && classes
+                .iter()
+                .all(|c| results.keys().any(|(class, _)| class == c))
+        };
+        if ran || batch.len() == 1 {
+            if cover.is_some() {
+                parts.push(part);
+            }
+            done += batch.len();
+            crate::say(&format!("  {done}/{} test files", files.len()));
+        } else {
+            runner::remove(side, &part);
+            let (a, b) = batch.split_at(batch.len() / 2);
+            queue.push(b);
+            queue.push(a);
+        }
     }
-    for file in files {
-        let rel = file
-            .strip_prefix(&side.repo)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
-        phpunit(config, &rel, &mut results);
+    if let Some((_, script)) = cover {
+        coverage::merge(side, script, &total, &parts);
     }
-    results
+    let file = cover.and_then(|_| coverage::fetch(config, &total, "generated.cov"));
+    runner::remove(side, &total);
+    (results, file)
 }
 
-fn phpunit(
+/// The class a generated test file declares, with its namespace.
+fn file_class(file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut namespace = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("namespace ") {
+            namespace = Some(rest.trim_end_matches(';').trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("final class ")
+            .or_else(|| line.strip_prefix("class "))
+        {
+            let class = rest.split_whitespace().next()?;
+            return Some(match namespace {
+                Some(n) => format!("{n}\\{class}"),
+                None => class.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// One PHPUnit run (`target`: a file, or --group ...), its results added to `results`; with `cover`, coverage goes
+/// to that scratch path. False when PHPUnit wrote no report.
+pub fn phpunit(
     config: &Config,
-    target: &str,
+    target: &[&str],
     results: &mut HashMap<(String, String), Option<String>>,
+    cover: Option<(Driver, &str)>,
 ) -> bool {
     let side = &config.new;
     let junit = runner::scratch(side, "junit.xml");
-    let command = config
-        .tests
-        .phpunit
-        .clone()
-        .unwrap_or_else(|| "php vendor/bin/phpunit".into());
-    let mut args: Vec<&str> = command.split_whitespace().collect();
-    args.extend(["--log-junit", &junit, target]);
+    let command = coverage::command(config, cover, phpunit_attributes(&side.repo));
+    let mut args: Vec<&str> = command.iter().map(String::as_str).collect();
+    args.extend(["--log-junit", &junit]);
+    args.extend(target);
     let _ = runner::run_in_app(side, &args);
     let local = config.work.join("junit.xml");
     let _ = std::fs::remove_file(&local);
@@ -735,14 +849,14 @@ fn phpunit(
     let mut any = false;
     for case in doc.descendants().filter(|n| n.has_tag_name("testcase")) {
         any = true;
+        // the full class name: PHPUnit 10+ writes it in class, older ones in classname with dots
         let class = case
             .attribute("class")
-            .map(|c| c.rsplit('\\').next().unwrap_or(c).to_string())
-            .or_else(|| {
-                case.attribute("classname")
-                    .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
-            })
-            .unwrap_or_default();
+            .map(String::from)
+            .or_else(|| case.attribute("classname").map(|c| c.replace('.', "\\")))
+            .unwrap_or_default()
+            .trim_start_matches('\\')
+            .to_string();
         let problem = case
             .children()
             .find(|n| n.has_tag_name("failure") || n.has_tag_name("error"));
@@ -788,6 +902,24 @@ fn phpunit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn class_of_a_test_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("UnitParityTest.php");
+        std::fs::write(
+            &file,
+            "<?php\n\nnamespace Tests\\Unit\\Models;\n\nuse Tests\\TestCase;\n\nclass UnitParityTest extends TestCase\n{\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            file_class(&file).as_deref(),
+            Some("Tests\\Unit\\Models\\UnitParityTest")
+        );
+        std::fs::write(&file, "<?php\nfinal class Bare extends X {}\n").unwrap();
+        assert_eq!(file_class(&file).as_deref(), Some("Bare"));
+        assert_eq!(file_class(&dir.path().join("missing.php")), None);
+    }
 
     fn put(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -921,7 +1053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config(
             dir.path(),
-            "[tests]\nacting_as = { api = '$user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");' }\nheaders = { X-Shop = '$user?->shop_id' }\nscope = { '*_shop_id' = '$shop->id' }\nquery = { page = '1' }\nbody = { locale = \"'en'\", owner = '$user->id' }\n",
+            "[tests]\nlayout = 'folder'\nacting_as = { api = '$user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");' }\nheaders = { X-Shop = '$user?->shop_id' }\nscope = { '*_shop_id' = '$shop->id' }\nquery = { page = '1' }\nbody = { locale = \"'en'\", owner = '$user->id' }\n",
         );
         models_repo(&config.new.repo);
         let show = "App\\Http\\Controllers\\ShopController@show";
@@ -1000,7 +1132,7 @@ mod tests {
             },
         )]);
         let skip = HashSet::from([(
-            "ShopControllerParityTest".to_string(),
+            "Tests\\Feature\\Parity\\ShopControllerParityTest".to_string(),
             "test_get_api_shops_shop#missing".to_string(),
         )]);
 
@@ -1045,6 +1177,7 @@ mod tests {
         for line in [
             "namespace Tests\\Feature\\Parity;",
             MARKER,
+            " * @group laravel-parity",
             "class ShopControllerParityTest extends \\Tests\\TestCase",
             "    /** GET api/shops/{shop} */",
             "    /** @dataProvider cases_get_api_shops_shop */",
@@ -1077,7 +1210,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config(
             dir.path(),
-            "[tests]\nnamespace = 'Tests\\Shop'\nbase_class = '\\Tests\\ShopCase'\ndir = 'tests/Shop'\n",
+            "[tests]\nlayout = 'folder'\nnamespace = 'Tests\\Shop'\nbase_class = '\\Tests\\ShopCase'\ndir = 'tests/Shop'\n",
         );
         put(
             &config.new.repo.join("composer.lock"),
@@ -1116,7 +1249,9 @@ mod tests {
         let php = std::fs::read_to_string(config.new.repo.join("tests/Shop/ClosureParityTest.php"))
             .unwrap();
         assert!(php.contains("namespace Tests\\Shop;"));
-        assert!(php.contains("class ClosureParityTest extends \\Tests\\ShopCase"));
+        assert!(php.contains(
+            " */\n#[\\PHPUnit\\Framework\\Attributes\\Group('laravel-parity')]\nclass ClosureParityTest extends \\Tests\\ShopCase"
+        ));
         assert!(
             php.contains("#[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_get_api_ping')]")
         );

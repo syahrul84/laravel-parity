@@ -63,7 +63,7 @@ fn tools() -> Value {
              "body": {"type": "object"}, "query": {"type": "object"}, "headers": {"type": "object"},
              "values": {"type": "object", "description": "Route parameter -> value, e.g. {\"lease\": \"42\"}"},
              "skip": {"type": "string", "description": "Reason to stop running this request; empty string to run it again"}}), &["pair", "route"])},
-        {"name": "generate_tests", "description": "Generate PHPUnit tests in the new repo for shared routes that have none (codemap decides), from the old app's answers, and run them. Several minutes. Background job.",
+        {"name": "generate_tests", "description": "Generate PHPUnit tests in the new repo for shared routes that have none (codemap decides), from the old app's answers, and run them; with pcov or Xdebug in the new app's PHP also the lines of app/ covered by the app's own tests and with the generated ones (the first time it runs the app's whole suite). Several minutes. Background job.",
          "inputSchema": schema(json!({"pair": pair, "verify": {"type": "boolean", "description": "Run the tests (default true)"},
              "drop_failing": {"type": "boolean", "description": "Remove the generated tests that fail"}, "wait_seconds": wait}), &["pair"])},
         {"name": "report_problem", "description": "Tell the tool's makers about a problem with laravel-parity itself (not with the app): a verdict that is wrong, an answer that was confusing or missing something, a fix that did not show up on rerun, a step that failed. Kept on this machine; the person can send it to GitHub later with `laravel-parity reports --send`. Do not include customer data: give the route pattern and what you expected versus saw.",
@@ -96,6 +96,15 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
         {"name": "learn", "description": "For requests that should pass but the old app refused with validation errors (verdict rejected): fill the fields its errors name and send them to both apps again, a few rounds. run already does this ([run] learn); use it after changing requests by hand. Background job.",
          "inputSchema": schema(json!({"pair": pair, "wait_seconds": wait}), &["pair"])},
+        {"name": "units_check", "description": "Every public method of the app's own classes (models: relations, scopes, accessors, settings like casts and fillable; services, exports, notifications, helpers ...) RUN on both apps (newest row for a model, arguments made the way a unit test would, rolled back, faked) and compared: methods that now throw, return another type or value, or write differently; model settings that changed (a $dates field missing from the new casts). Results go into fix_list (area Code); generate_tests turns the old app's answers into unit tests next to the app's own. Background job.",
+         "inputSchema": schema(json!({"pair": pair, "only": {"type": "string", "description": "Only classes whose name contains this; keeps the others' results"}, "wait_seconds": wait}), &["pair"])},
+        {"name": "coverage_gaps", "description": "The methods of app/ with the most lines no test runs (the app's own tests, the generated ones and the ones you wrote, together; measured by generate_tests), each with its file:line, the lines missed, and where a test for it belongs (test_file / test_class next to the app's own tests). Use it to raise line coverage to the pair file's target (default 80%): read the method, write a PHPUnit test for the missed lines in test_file with the class in group laravel-parity-ai (#[\\PHPUnit\\Framework\\Attributes\\Group('laravel-parity-ai')] for PHPUnit 10+, else @group laravel-parity-ai), expecting what the OLD app does (ask it with probe_code), then check_tests. Repeat until the target is met.",
+         "inputSchema": schema(json!({"pair": pair, "filter": {"type": "string", "description": "Only files whose path contains this, e.g. Models or Services/Billing"},
+             "limit": {"type": "integer", "description": "Default 20"}}), &["pair"])},
+        {"name": "check_tests", "description": "Run test files you wrote (paths in the new repo) on the new app with coverage: which tests pass or fail (with the message), what they add, and the line coverage of app/ now against the target. A failing test that expects the old app's behaviour is a real difference to fix in the new code, not in the test.",
+         "inputSchema": schema(json!({"pair": pair, "files": {"type": "array", "items": {"type": "string"}}}), &["pair", "files"])},
+        {"name": "probe_code", "description": "Run a few lines of PHP on BOTH apps (each on its own test database copy, in a rolled-back transaction, mail/queue/HTTP faked) and get what each returned: type, value (JSON), keys, or the exception. Use it to learn what the OLD app does before writing a test, e.g. `return app(\\App\\Services\\Rent::class)->total(\\App\\Models\\Lease::find(12));`. $app is the application.",
+         "inputSchema": schema(json!({"pair": pair, "code": {"type": "string", "description": "PHP statements ending in a return"}}), &["pair", "code"])},
         {"name": "recorder", "description": "Write a middleware (runs/<name>/ParityRecorder.php) that records real saves (POST/PUT/PATCH/DELETE answered 2xx, with bodies, secrets left out) on a test or staging copy of the OLD app, with install steps for the user. import_log then reads its parity-requests.jsonl as rec-<n> cases. Show the user the steps; never install it on production.",
          "inputSchema": schema(json!({"pair": pair}), &["pair"])},
         {"name": "import_log", "description": "Add real requests as extra cases: from a web server access log (nginx/Apache combined: successful GETs, as log-<n>, with the ids, filters, sorting and paging real users sent) or from the recorder's parity-requests.jsonl (real saves with bodies, as rec-<n>). Values that look like secrets are dropped. A file path on this machine. Then run (or rerun the routes) to compare them.",
@@ -821,6 +830,35 @@ fn call(name: &str, args: &Value) -> Res<String> {
             Ok(format!("{line}. The fix list is updated."))
         }),
         "recorder" => crate::logs::recorder(&load(args)?),
+        "units_check" => {
+            let only = args["only"].as_str().map(String::from);
+            start("units_check", args, move |c| {
+                let line = crate::units::check(&c, only.as_deref())?;
+                crate::ops::report(&c)?;
+                Ok(format!("{line}. The fix list is updated."))
+            })
+        }
+        "coverage_gaps" => crate::coverage::gaps(
+            &load(args)?,
+            args["filter"].as_str(),
+            args["limit"].as_u64().unwrap_or(20) as usize,
+        )
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
+        "check_tests" => {
+            let files: Vec<String> = args["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f.as_str().map(String::from))
+                .collect();
+            crate::coverage::check_tests(&load(args)?, &files)
+                .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+        }
+        "probe_code" => crate::units::probe_code(
+            &load(args)?,
+            args["code"].as_str().ok_or("code is required")?,
+        )
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
         "import_log" => crate::logs::import(
             &load(args)?,
             &config::expand(args["log"].as_str().ok_or("log is required")?),

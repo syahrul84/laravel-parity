@@ -340,7 +340,7 @@ pub fn init(
     };
     let _ = writeln!(
         text,
-        "[tests]\ndir = \"tests/Feature/Parity\"\nnamespace = \"Tests\\\\Feature\\\\Parity\"\nbase_class = {base:?}\nphpunit = \"php vendor/bin/phpunit\""
+        "[tests]\n# next to the app's own tests, following app/ (\"folder\" puts the feature tests in one dir)\nlayout = \"mirror\"\nbase_class = {base:?}\nphpunit = \"php vendor/bin/phpunit\"\ntarget = 80"
     );
     if let Some((guard, _, model)) = &first {
         // {:?} escapes backslashes and quotes the way a TOML basic string wants them

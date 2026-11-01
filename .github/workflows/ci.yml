@@ -51,7 +51,7 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: pdo_sqlite
-          coverage: none
+          coverage: pcov
       - name: Laravel ${{ matrix.laravel }} app
         if: github.event_name != 'schedule' || matrix.nightly
         run: |
