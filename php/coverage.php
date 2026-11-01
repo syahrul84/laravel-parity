@@ -36,8 +36,16 @@ function parity_load($file)
         return null;
     }
     $coverage = include $file;
+    if (! is_object($coverage)) {
+        return null;
+    }
+    // php-code-coverage 9 (processUncoveredFiles in phpunit.xml) would run the files no test ran, under the coverage
+    // driver of this PHP, to count their lines; reading their source counts them the same without running app code
+    if (method_exists($coverage, 'doNotProcessUncoveredFiles')) {
+        $coverage->doNotProcessUncoveredFiles();
+    }
 
-    return is_object($coverage) ? $coverage : null;
+    return $coverage;
 }
 
 function parity_save($coverage, $file)
