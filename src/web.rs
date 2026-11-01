@@ -264,3 +264,136 @@ pub fn last(config: &Config) -> Option<Value> {
     config.web_old.as_ref()?;
     read(&config.work.join("web.json"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn problems_of_a_call() {
+        assert_eq!(problems(&json!({"status": "missing"})), vec!["missing"]);
+        assert!(problems(&json!({"status": "matched"})).is_empty());
+        assert!(problems(&json!({"status": "unresolved"})).is_empty());
+        assert!(problems(&json!({"status": "external", "unknown_field": []})).is_empty());
+        // a matched call can still send fields the route rejects; a status already counted is not repeated
+        assert_eq!(
+            problems(&json!({
+                "status": "missing_required",
+                "missing_required": ["name"],
+                "unknown_field": ["nmae"],
+                "possible_rename": [{"from": "nmae", "to": "name"}],
+                "fields_not_returned": [],
+            })),
+            vec!["missing_required", "unknown_field", "possible_rename"]
+        );
+        let call = json!({"call": "POST /shops", "at": "a.vue:1", "unknown_field": ["x"]});
+        let moved = json!({"call": "POST /shops", "at": "b.vue:9", "unknown_field": ["x"]});
+        assert_eq!(
+            signature(&call, "unknown_field"),
+            signature(&moved, "unknown_field")
+        );
+        assert_eq!(
+            signature(&call, "unknown_field"),
+            "unknown_field|POST /shops|[\"x\"]"
+        );
+        assert_eq!(signature(&call, "missing"), "missing|POST /shops|");
+        assert_ne!(
+            signature(&call, "unknown_field"),
+            signature(
+                &json!({"call": "POST /shops", "unknown_field": ["y"]}),
+                "unknown_field"
+            )
+        );
+    }
+
+    #[test]
+    fn fields_sent_per_route() {
+        let calls = vec![
+            json!({"route": "GET|HEAD api/shops", "payload_evidence": {"sends": ["page"]}}),
+            json!({"route": "PUT|PATCH api/shops/{shop}", "payload_evidence": {"sends": ["name", 1]}}),
+            json!({"route": "PUT|PATCH api/shops/{shop}", "payload_evidence": {"sends": ["email", "name"]}}),
+            json!({"route": "POST api/orders", "payload_evidence": {}}),
+            json!({"payload_evidence": {"sends": ["lost"]}}),
+            json!({"route": "orphan", "payload_evidence": {"sends": ["q"]}}),
+        ];
+        let found = sends_by_route(&calls);
+        let names = |k: &str| found[k].iter().cloned().collect::<Vec<_>>();
+        assert_eq!(names("GET api/shops"), vec!["page"]);
+        assert_eq!(names("PUT api/shops/{shop}"), vec!["email", "name"]);
+        assert_eq!(names("PATCH api/shops/{shop}"), vec!["email", "name"]);
+        assert_eq!(names(" orphan"), vec!["q"]);
+        assert!(!found.contains_key("HEAD api/shops"));
+        assert!(!found.contains_key("POST api/orders"));
+        assert_eq!(found.len(), 4);
+    }
+
+    #[test]
+    fn answered_at_runtime() {
+        let runtime = vec![
+            (
+                "POST".to_string(),
+                regex::Regex::new(r"^/?oauth/token/?$").unwrap(),
+            ),
+            (
+                "GET".to_string(),
+                regex::Regex::new(r"^/?api/shops/[^/]+/?$").unwrap(),
+            ),
+        ];
+        assert!(answered(&json!({"call": "POST /oauth/token"}), &runtime));
+        assert!(answered(&json!({"call": "GET /shops/{}"}), &runtime));
+        assert!(answered(&json!({"call": "GET /api/shops/7/"}), &runtime));
+        assert!(!answered(&json!({"call": "DELETE /shops/{}"}), &runtime));
+        assert!(!answered(
+            &json!({"call": "GET /shops/{}/orders"}),
+            &runtime
+        ));
+        assert!(!answered(&json!({"call": "GET"}), &runtime));
+        assert!(!answered(&json!({}), &runtime));
+        assert!(!answered(&json!({"call": "GET /shops/1"}), &[]));
+    }
+
+    #[test]
+    fn last_needs_web_in_the_pair_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for repo in ["shop-old", "shop", "shop-web"] {
+            std::fs::create_dir_all(root.join(repo)).unwrap();
+        }
+        let pair = root.join("shop.toml");
+        let text = format!(
+            "work = {:?}\n[old]\nrepo = {:?}\n[new]\nrepo = {:?}\n[database]\nsource = \"shop\"\n",
+            root.join("runs").display().to_string(),
+            root.join("shop-old").display().to_string(),
+            root.join("shop").display().to_string()
+        );
+        std::fs::write(&pair, &text).unwrap();
+        let config = crate::config::load(&pair).unwrap();
+        std::fs::create_dir_all(&config.work).unwrap();
+        write(
+            &config.work.join("web.json"),
+            &json!({"fixed_by_upgrade": 2}),
+        )
+        .unwrap();
+        assert!(last(&config).is_none());
+        assert!(web_repos(&config).is_none());
+        assert!(sends(&config).is_empty());
+        assert!(check(&config).unwrap_err().contains("no [web] old"));
+
+        let web = root.join("shop-web").display().to_string();
+        std::fs::write(&pair, format!("{text}[web]\nold = {web:?}\n")).unwrap();
+        let config = crate::config::load(&pair).unwrap();
+        assert_eq!(last(&config).unwrap()["fixed_by_upgrade"], 2);
+        let (old, new) = web_repos(&config).unwrap();
+        assert_eq!(old, new);
+
+        std::fs::write(
+            &pair,
+            format!("{text}[web]\nold = {web:?}\nnew = \"/srv/shop-web-new\"\n"),
+        )
+        .unwrap();
+        let config = crate::config::load(&pair).unwrap();
+        let (old, new) = web_repos(&config).unwrap();
+        assert_eq!(old, root.join("shop-web"));
+        assert_eq!(new, Path::new("/srv/shop-web-new"));
+    }
+}

@@ -783,3 +783,346 @@ fn phpunit(
     }
     any
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn put(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A pair file for two fake repos in a temp folder, with `extra` appended (a [tests] section).
+    fn config(dir: &Path, extra: &str) -> Config {
+        let (old, new) = (dir.join("shop-old"), dir.join("shop"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let pair = dir.join("pairs").join("shop.toml");
+        put(
+            &pair,
+            &format!(
+                "name = \"shop\"\nwork = {:?}\n[old]\nrepo = {:?}\n[new]\nrepo = {:?}\n[database]\nsource = \"shop\"\n{extra}",
+                dir.join("runs").display().to_string(),
+                old.display().to_string(),
+                new.display().to_string()
+            ),
+        );
+        crate::config::load(&pair).unwrap()
+    }
+
+    /// Shop (own HasFactory), Order (factory through its parent, own $table), Item (no factory file).
+    fn models_repo(repo: &Path) {
+        put(
+            &repo.join("app/Models/Shop.php"),
+            "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Factories\\HasFactory;\nclass Shop extends Model\n{\n    use HasFactory;\n}\n",
+        );
+        put(
+            &repo.join("app/Models/Base.php"),
+            "<?php\nnamespace App\\Models;\nabstract class Base extends Model\n{\n    use HasFactory;\n}\n",
+        );
+        put(
+            &repo.join("app/Models/Order.php"),
+            "<?php\nnamespace App\\Models;\nclass Order extends Base\n{\n    protected $table = 'shop_orders';\n}\n",
+        );
+        put(
+            &repo.join("app/Models/Item.php"),
+            "<?php\nnamespace App\\Models;\nclass Item extends Model\n{\n    use HasFactory;\n}\n",
+        );
+        for f in ["ShopFactory", "OrderFactory"] {
+            put(&repo.join(format!("database/factories/{f}.php")), "<?php\n");
+        }
+    }
+
+    #[test]
+    fn php_text() {
+        assert_eq!(php_string(r"it's C:\shop $5"), r"'it\'s C:\\shop $5'");
+        assert_eq!(
+            php_value(&json!({"a": null, "b": [1, true, "x'y"], "c": {}})),
+            r"['a' => null, 'b' => [1, true, 'x\'y'], 'c' => []]"
+        );
+        let mut taken = HashSet::new();
+        assert_eq!(
+            method_name("GET api/shops/{shop}", &mut taken),
+            "test_get_api_shops_shop"
+        );
+        assert_eq!(
+            method_name("GET api/shops/{shop?}", &mut taken),
+            "test_get_api_shops_shop_2"
+        );
+        assert_eq!(method_name(&"a".repeat(200), &mut taken).len(), 120);
+        assert_eq!(
+            controller_class(Some("App\\Http\\Controllers\\ShopController@show")),
+            "ShopController"
+        );
+        assert_eq!(controller_class(Some("App\\Http\\Invokable")), "Invokable");
+        assert_eq!(controller_class(Some("@@")), "Closure");
+        assert_eq!(controller_class(None), "Closure");
+        assert_eq!(json_id("999"), json!(999));
+        assert_eq!(json_id("nope"), json!("nope"));
+    }
+
+    #[test]
+    fn json_structure() {
+        let body = json!({"data": [{"id": 1, "shop": {"name": "a", "deep": {"x": 1}}}], "meta": {"total": 1}, "ok": true, "tags": [1, 2], "empty": {}});
+        assert_eq!(
+            php_shape(&shape(&body, 0)),
+            "['data' => ['*' => ['id', 'shop']], 'meta' => ['total'], 'ok', 'tags', 'empty']"
+        );
+        assert_eq!(
+            php_shape(&shape(&json!({"a": {"b": {"c": {"d": 1}}}}), 0)),
+            "['a' => ['b' => ['c']]]"
+        );
+        assert!(shape(&json!([1]), 0).is_empty());
+    }
+
+    #[test]
+    fn models_and_phpunit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        models_repo(repo);
+        let models = Models::read(repo);
+        assert_eq!(models.by_table["shops"], "App\\Models\\Shop");
+        assert_eq!(models.by_table["shop_orders"], "App\\Models\\Order");
+        assert!(!models.by_table.contains_key("items"));
+        assert!(!models.by_table.contains_key("bases"));
+
+        assert!(!phpunit_attributes(repo));
+        let lock = |v: &str| {
+            json!({"packages": [], "packages-dev": [{"name": "phpunit/phpunit", "version": v}]})
+                .to_string()
+        };
+        put(&repo.join("composer.lock"), &lock("9.6.19"));
+        assert!(!phpunit_attributes(repo));
+        put(&repo.join("composer.lock"), &lock("v10.5.1"));
+        assert!(phpunit_attributes(repo));
+        put(&repo.join("composer.lock"), &lock("11.0.0"));
+        assert!(phpunit_attributes(repo));
+    }
+
+    fn spec(id: &str, key: &str, case: &str, action: Option<&str>) -> Spec {
+        let (method, template) = key.split_once(' ').unwrap();
+        Spec {
+            id: id.into(),
+            key: key.into(),
+            case: case.into(),
+            method: method.into(),
+            template: template.into(),
+            uri: template.into(),
+            guard: (case != "guest").then(|| "api".to_string()),
+            action: action.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(
+            dir.path(),
+            "[tests]\nacting_as = { api = '$user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");' }\nheaders = { X-Shop = '$user?->shop_id' }\nscope = { '*_shop_id' = '$shop->id' }\nquery = { page = '1' }\nbody = { locale = \"'en'\", owner = '$user->id' }\n",
+        );
+        models_repo(&config.new.repo);
+        let show = "App\\Http\\Controllers\\ShopController@show";
+        let mut specs = vec![];
+        for (id, case) in [
+            ("s1", "happy"),
+            ("s2", "guest"),
+            ("s3", "missing"),
+            ("s4", "broken"),
+        ] {
+            let mut s = spec(id, "GET api/shops/{shop}", case, Some(show));
+            s.sources.insert("shop".into(), "shops.id".into());
+            s.body = Some(json!({"ignored": "for GET"}));
+            specs.push(s);
+        }
+        let mut store = spec("o1", "PUT api/orders/{order}/{note?}", "happy", Some(show));
+        store
+            .sources
+            .insert("order".into(), "shop_orders.id".into());
+        store.body = Some(json!({"name": "it's \\ $5", "shop": "{order}"}));
+        store.custom = true;
+        let mut invalid = spec(
+            "o2",
+            "PUT api/orders/{order}/{note?}",
+            "without-name",
+            Some(show),
+        );
+        invalid.sources = store.sources.clone();
+        invalid.without = vec!["name".into()];
+        specs.extend([store, invalid]);
+        specs.push(spec("t1", "GET api/things/{thing}", "happy", Some(show)));
+        specs.push(spec("c1", "GET api/ping", "happy", None));
+        specs.push(spec("x1", "GET api/tested", "happy", Some("App\\X@y")));
+        specs.push(spec("h1", "GET api/hand", "happy", Some("App\\Hand@y")));
+        put(
+            &config
+                .new
+                .repo
+                .join("tests/Feature/Parity/HandParityTest.php"),
+            "<?php // mine\n",
+        );
+
+        let old_rows: HashMap<String, Value> = [
+            (
+                "s1",
+                json!({"status": 200, "kind": "json", "json": {"data": {"id": 1, "name": "a"}}}),
+            ),
+            (
+                "s2",
+                json!({"status": 401, "kind": "json", "json": {"message": "no"}}),
+            ),
+            ("s3", json!({"status": 404, "kind": "html", "json": null})),
+            ("s4", json!({"status": 500, "kind": "json", "json": {}})),
+            ("o1", json!({"status": 204, "kind": "empty", "json": null})),
+            (
+                "o2",
+                json!({"status": 422, "kind": "json", "json": {"errors": {"name": ["required"]}}}),
+            ),
+            ("t1", json!({"status": 200, "kind": "json", "json": {}})),
+            ("c1", json!({"status": 500, "kind": "json", "json": {}})),
+            ("h1", json!({"status": 200, "kind": "json", "json": {}})),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let untested: BTreeSet<String> = specs
+            .iter()
+            .map(|s| s.key.clone())
+            .filter(|k| k != "GET api/tested")
+            .collect();
+        let tables = BTreeMap::from([(
+            "shop_orders".to_string(),
+            TableInfo {
+                columns: vec!["id".into(), "owner_shop_id".into(), "name".into()],
+                pk: Some("id".into()),
+            },
+        )]);
+        let skip = HashSet::from([(
+            "ShopControllerParityTest".to_string(),
+            "test_get_api_shops_shop#missing".to_string(),
+        )]);
+
+        let out = generate(&config, &specs, &old_rows, &untested, &tables, &skip);
+        let dir_tests = config.new.repo.join("tests/Feature/Parity");
+        assert_eq!(
+            out.files,
+            vec![dir_tests.join("ShopControllerParityTest.php")]
+        );
+        assert!(!dir_tests.join("ClosureParityTest.php").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir_tests.join("HandParityTest.php")).unwrap(),
+            "<?php // mine\n"
+        );
+        let made: Vec<&str> = out.made.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(
+            made,
+            vec![
+                "test_get_api_shops_shop#happy",
+                "test_get_api_shops_shop#guest",
+                "test_put_api_orders_order_note#happy",
+                "test_put_api_orders_order_note#without-name",
+            ]
+        );
+        let cannot: BTreeMap<&str, &str> = out
+            .cannot
+            .iter()
+            .map(|(k, w)| (k.as_str(), w.as_str()))
+            .collect();
+        assert_eq!(cannot["GET api/ping"], "happy: old app answered 500");
+        assert_eq!(
+            cannot["GET api/things/{thing}"],
+            "no factory for {thing} (value typed by hand)"
+        );
+        assert_eq!(
+            cannot["GET api/hand"],
+            "HandParityTest.php was edited by hand (no marker)"
+        );
+        assert!(!cannot.contains_key("GET api/tested"));
+
+        let php = std::fs::read_to_string(&out.files[0]).unwrap();
+        for line in [
+            "namespace Tests\\Feature\\Parity;",
+            MARKER,
+            "class ShopControllerParityTest extends \\Tests\\TestCase",
+            "    /** GET api/shops/{shop} */",
+            "    /** @dataProvider cases_get_api_shops_shop */",
+            "    public function test_get_api_shops_shop(bool $signIn, bool $missing, array $body, array $without, int $status, array $structure, array $errors): void",
+            "        $shop = \\App\\Models\\Shop::factory()->create([]);",
+            "        $shopKey = $missing ? 999999999 : $shop->getKey();",
+            "            $user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");",
+            "        $this->withHeaders(['X-Shop' => (string) $user?->shop_id]);",
+            "        $data = array_merge(['page' => 1], $body);",
+            "        $response = $this->json('GET', \"api/shops/{$shopKey}\", $data);",
+            "            'happy' => [true, false, [], [], 200, ['data' => ['id', 'name']], []],",
+            "            'guest' => [false, false, [], [], 401, [], []],",
+            "        $order = \\App\\Models\\Order::factory()->create(['owner_shop_id' => $shop->id]);",
+            "        $data = array_merge(['locale' => 'en', 'owner' => $user?->id], $body);",
+            "        $fill = ['{user}' => $user?->getKey(), '{order}' => $orderKey];",
+            "        $response = $this->json('PUT', \"api/orders/{$orderKey}\", $data);",
+            r"            'happy' => [true, false, ['name' => 'it\'s \\ $5', 'shop' => '{order}'], [], 204, [], []],",
+            "            'without-name' => [true, false, [], ['name'], 422, [], ['name']],",
+        ] {
+            assert!(php.contains(line), "missing {line:?} in\n{php}");
+        }
+        assert!(!php.contains("'missing' =>"));
+        assert!(!php.contains("'broken' =>"));
+        assert!(!php.contains("ignored"));
+        assert!(php.ends_with("}\n"));
+    }
+
+    #[test]
+    fn attributes_and_missing_acting_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(
+            dir.path(),
+            "[tests]\nnamespace = 'Tests\\Shop'\nbase_class = '\\Tests\\ShopCase'\ndir = 'tests/Shop'\n",
+        );
+        put(
+            &config.new.repo.join("composer.lock"),
+            &json!({"packages-dev": [{"name": "phpunit/phpunit", "version": "10.0.0"}]})
+                .to_string(),
+        );
+        let mut guest = spec("g", "GET api/ping", "guest", None);
+        guest.custom = true;
+        let signed = spec("p", "POST api/pong", "happy", None);
+        let old_rows: HashMap<String, Value> = HashMap::from([
+            (
+                "g".to_string(),
+                json!({"status": 200, "kind": "json", "json": {}}),
+            ),
+            (
+                "p".to_string(),
+                json!({"status": 201, "kind": "json", "json": {}}),
+            ),
+        ]);
+        let untested: BTreeSet<String> = ["GET api/ping", "POST api/pong"].map(String::from).into();
+        let out = generate(
+            &config,
+            &[guest, signed],
+            &old_rows,
+            &untested,
+            &BTreeMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            out.cannot,
+            vec![(
+                "POST api/pong".to_string(),
+                "no [tests.acting_as] api in the pair file".to_string()
+            )]
+        );
+        let php = std::fs::read_to_string(config.new.repo.join("tests/Shop/ClosureParityTest.php"))
+            .unwrap();
+        assert!(php.contains("namespace Tests\\Shop;"));
+        assert!(php.contains("class ClosureParityTest extends \\Tests\\ShopCase"));
+        assert!(
+            php.contains("#[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_get_api_ping')]")
+        );
+        assert!(php.contains("$fill = ['{user}' => $user?->getKey()];"));
+        assert!(!php.contains("$this->withHeaders"));
+        assert!(!php.contains("if ($signIn)"));
+        assert!(php.contains("$response = $this->json('GET', \"api/ping\", $data);"));
+    }
+}

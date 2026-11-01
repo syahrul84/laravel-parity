@@ -180,3 +180,153 @@ pub fn write(
     }
     std::fs::write(path, out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rendered_report() {
+        let dir =
+            std::env::temp_dir().join(format!("laravel-parity-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pair = dir.join("shop.toml");
+        std::fs::write(
+            &pair,
+            "name = \"shop\"\n[old]\nrepo = \"/nonexistent/shop-old\"\n[new]\nrepo = \"/nonexistent/shop\"\n\
+             [database]\nsource = \"shop\"\n",
+        )
+        .unwrap();
+        let config = crate::config::load(&pair).unwrap();
+        let meta = json!({
+            "old": {"info": {"php": "7.4", "laravel": "5.5", "capabilities": {"mail": false}},
+                    "auth": {"api": "signed in as user 1"}},
+            "new": {"info": {"php": "8.3", "laravel": "11.0", "mysql": "8.0"}},
+        });
+        let diff: RouteDiff = serde_json::from_value(json!({
+            "removed": ["GET api/legacy"], "added": ["GET api/health"],
+            "changed": [
+                {"route": "GET api/a", "changes": ["middleware: +throttle"]},
+                {"route": "GET api/b", "changes": ["middleware: +throttle"]},
+                {"route": "GET api/c", "changes": ["action: OrderController@show -> OrderController@view"]},
+            ]})).unwrap();
+        let outcome = |key: &str, case: &str, verdict: &str, old: i64, new: i64, notes: Value| {
+            serde_json::from_value::<Outcome>(json!({"id": key, "key": key, "case": case,
+                "uri": key.split(' ').nth(1).unwrap(), "verdict": verdict, "old_status": old,
+                "new_status": new, "notes": notes}))
+            .unwrap()
+        };
+        let results = [
+            outcome("GET api/shops", "happy", "same", 200, 200, json!([])),
+            outcome(
+                "GET api/orders",
+                "guest",
+                "status",
+                401,
+                200,
+                json!(["auth dropped"]),
+            ),
+            outcome(
+                "GET api/cart",
+                "happy",
+                "body",
+                200,
+                200,
+                json!(["$.total differs"]),
+            ),
+            outcome("GET api/area", "happy", "body", 200, 200, json!([])),
+        ];
+        let skipped = [
+            Skipped {
+                key: "GET api/z/{z}".into(),
+                why: "no value for z".into(),
+            },
+            Skipped {
+                key: "GET api/a/{a}".into(),
+                why: "no value for a".into(),
+            },
+        ];
+        let tests = json!({"untested": 3, "generated": 2, "dir": "tests/Feature/Parity",
+                           "passed": 1, "failed": 1, "cannot": 0});
+        let path = dir.join("report.md");
+        write(
+            &path,
+            &config,
+            &meta,
+            &diff,
+            &results,
+            &skipped,
+            Some(&tests),
+        )
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        assert!(md.starts_with("# Parity report: shop\n\nMade "));
+        assert!(md.contains("| php | 7.4 | 8.3 |\n| laravel | 5.5 | 11.0 |\n| mysql | ? | 8.0 |"));
+        assert!(md.contains("> **mail NOT compared**: the old app (Laravel 5.5)"));
+        assert!(md.contains("> old app, guard api: signed in as user 1"));
+        assert!(md.contains(
+            "| Different status code | 1 |\n| Different response body | 2 |\n| Same | 1 |"
+        ));
+        assert!(md.contains("| Not run (parameter not found, or skipped) | 2 |"));
+        assert!(
+            md.contains("only in the new app: **1**, controller or middleware changed: **3**.")
+        );
+        assert!(md.contains("PHPUnit: 3 shared routes had no test; 2 tests generated in `tests/Feature/Parity`, 1 pass"));
+        // each verdict but "same" lists its requests, sorted by route
+        assert!(!md.contains("## Same"));
+        assert!(md.contains("## Different status code (1)\n\n- **GET api/orders [guest]** `api/orders` (401 → 200)\n  - auth dropped\n"));
+        let area = md.find("- **GET api/area**").unwrap();
+        assert!(area < md.find("- **GET api/cart**").unwrap());
+        assert!(md.contains("### Only in the old app\n\n- GET api/legacy\n"));
+        assert!(md.contains("### Only in the new app\n\n- GET api/health\n"));
+        // the change most routes share comes first; controller changes list every route
+        let throttle = md
+            .find("- **middleware: +throttle**: 2 routes, e.g. GET api/a, GET api/b")
+            .unwrap();
+        let controller = md
+            .find("- **controller changed**: 1 routes, e.g. GET api/c: action: ")
+            .unwrap();
+        assert!(throttle < controller);
+        assert!(md.contains("  - GET api/c: action: OrderController@show -> OrderController@view"));
+        assert!(
+            md.find("- GET api/a/{a}: no value for a").unwrap()
+                < md.find("- GET api/z/{z}: no value for z").unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "laravel-parity-report-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pair = dir.join("shop.toml");
+        std::fs::write(&pair, "[old]\nrepo = \"/nonexistent/a\"\n[new]\nrepo = \"/nonexistent/b\"\n[database]\nsource = \"shop\"\n").unwrap();
+        let config = crate::config::load(&pair).unwrap();
+        let path = dir.join("report.md");
+        write(
+            &path,
+            &config,
+            &json!({}),
+            &RouteDiff::default(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+        assert!(md.starts_with("# Parity report: shop\n"));
+        assert!(md.contains("| database | ? | ? |"));
+        assert!(md.contains("| Not run (parameter not found, or skipped) | 0 |"));
+        assert!(md.contains("Routes only in the old app: **0**"));
+        assert!(!md.contains("PHPUnit") && !md.contains("## Not run") && !md.contains("###"));
+        assert!(md.ends_with("## Route changes\n\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

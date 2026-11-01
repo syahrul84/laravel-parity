@@ -814,3 +814,243 @@ pub fn write_all(config: &Config) -> Res<Vec<Fix>> {
     std::fs::write(config.work.join("fixes.md"), out).map_err(|e| e.to_string())?;
     Ok(fixes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pair file in a fresh temp folder whose runs go to <folder>/work; the repos need not exist.
+    fn config(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!(
+            "laravel-parity-fixlist-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let pair = dir.join("shop.toml");
+        let toml = format!(
+            "name = \"shop\"\nwork = '{}'\n[old]\nrepo = \"/nonexistent/shop-old\"\ncontainer = \"shop-old-php\"\n\
+             app_path = \"/var/www/html\"\n[new]\nrepo = \"/nonexistent/shop\"\ncontainer = \"shop-php\"\n\
+             app_path = \"/var/www/html\"\n[database]\nsource = \"shop\"\n",
+            dir.join("work").display()
+        );
+        std::fs::write(&pair, toml).unwrap();
+        crate::config::load(&pair).unwrap()
+    }
+
+    fn outcome(id: &str, key: &str, case: &str, verdict: &str, old: i64, new: i64) -> Value {
+        json!({"id": id, "key": key, "case": case, "uri": key.split(' ').nth(1).unwrap_or(""),
+               "verdict": verdict, "old_status": old, "new_status": new, "notes": []})
+    }
+
+    #[test]
+    fn hints_and_places() {
+        assert!(
+            hint("Foo::bar(): Argument #1 ($id) must be of type int, string given")
+                .unwrap()
+                .starts_with("A type added")
+        );
+        assert!(
+            hint("SQLSTATE[42S22]: Unknown column 'shop_id' in 'where clause'")
+                .unwrap()
+                .contains("migration")
+        );
+        assert!(hint("Error saving order.").unwrap().contains("try/catch"));
+        assert_eq!(hint("everything is fine"), None);
+        assert_eq!(cause("No order 42 for 'x' given"), "No order … for …");
+        assert_eq!(cause("Bad (SQL: select * from orders)"), "Bad …");
+        let row = json!({"json": {"exception": "Symfony\\Component\\HttpKernel\\Exception\\HttpException",
+            "message": "Boom", "file": "/var/www/html/vendor/laravel/framework/src/Foo.php", "line": 10,
+            "trace": [{"file": "/var/www/html/vendor/x.php", "line": 1},
+                      {"file": "/var/www/html/app/Http/Controllers/OrderController.php", "line": 42}]}});
+        assert_eq!(
+            location(&row, "/var/www/html/").as_deref(),
+            Some("app/Http/Controllers/OrderController.php:42")
+        );
+        assert_eq!(message(&row), "HttpException: Boom");
+        assert_eq!(message(&json!({"error": "timed out"})), "timed out");
+        assert_eq!(
+            location(&json!({"error": "timed out"}), "/var/www/html"),
+            None
+        );
+        assert!(ok(&json!(204)) && !ok(&json!(302)) && !ok(&Value::Null));
+        assert!(denied(&json!(401)) && denied(&json!(403)) && !denied(&json!(404)));
+    }
+
+    #[test]
+    fn speed_items() {
+        let mut fast: Outcome =
+            serde_json::from_value(outcome("1", "GET api/orders", "happy", "same", 200, 200))
+                .unwrap();
+        fast.queries = Some([3, 40]);
+        fast.ms = Some([100, 900]);
+        let mut small = fast.clone();
+        small.key = "GET api/shops".into();
+        small.queries = Some([3, 9]); // more than double, but under 10 more
+        small.ms = Some([100, 500]); // under three times
+        let mut broken = fast.clone();
+        broken.verdict = "new-broken".into();
+        let fixes = speed(&[fast, small, broken]);
+        assert_eq!(fixes.len(), 2);
+        assert_eq!((fixes[0].priority, fixes[0].area.as_str()), (3, "Speed"));
+        assert_eq!(fixes[0].details, ["GET api/orders: 3 -> 40 queries"]);
+        assert_eq!(fixes[1].priority, 4);
+        assert_eq!(fixes[1].details, ["GET api/orders: 100 -> 900 ms"]);
+        assert!(speed(&[]).is_empty());
+    }
+
+    #[test]
+    fn items_from_a_run() {
+        let config = config("run");
+        assert_eq!(build(&config).unwrap_err(), "no results yet: run first");
+        let work = &config.work;
+        let mut results = vec![
+            outcome(
+                "1",
+                "GET api/orders/{order}",
+                "happy",
+                "new-broken",
+                200,
+                500,
+            ),
+            outcome("2", "GET api/orders", "happy", "new-broken", 200, 500),
+            outcome("3", "GET api/admin", "guest", "status", 401, 200),
+            outcome("4", "GET api/profile", "happy", "status", 200, 403),
+            outcome("5", "POST api/orders", "empty", "status", 422, 201),
+            outcome("6", "POST api/users", "without-email", "status", 422, 200),
+            outcome("7", "PUT api/orders/{order}", "happy", "status", 200, 422),
+            outcome("8", "GET api/cart", "happy", "body", 200, 200),
+            outcome("9", "POST api/cart", "happy", "effects", 200, 200),
+            outcome("10", "GET api/reports", "happy", "both-fail", 500, 500),
+            outcome("11", "GET api/reports", "ai-1", "both-fail", 500, 500),
+            outcome("12", "POST api/shops", "happy", "rejected", 422, 422),
+        ];
+        results[7]["notes"] = json!(["$.data.total is missing in new", "$.data.tax differs"]);
+        results[8]["notes"] = json!(["rows: only old wrote orders"]);
+        results[10]["notes"] = json!(["500 on both"]);
+        results[11]["notes"] =
+            json!(["both apps refuse the input: name: The name field is required."]);
+        write(&work.join("results.json"), &results).unwrap();
+        let trace = json!({"exception": "TypeError",
+            "message": "App\\Http\\Controllers\\OrderController::show(): Argument #1 ($id) must be of type int, string given",
+            "file": "/var/www/html/vendor/laravel/framework/src/Route.php", "line": 3,
+            "trace": [{"file": "/var/www/html/app/Http/Controllers/OrderController.php", "line": 42}]});
+        let rows = [
+            json!({"id": "1", "json": trace}),
+            json!({"id": "2", "json": trace}),
+            json!({"id": "7", "json": {"message": "invalid", "errors": {"phone": ["required"]}}}),
+        ];
+        let jsonl: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(work.join("results-new.jsonl"), jsonl).unwrap();
+        let specs = vec![
+            Spec {
+                id: "6".into(),
+                key: "POST api/users".into(),
+                case: "without-email".into(),
+                without: vec!["email".into()],
+                ..Default::default()
+            },
+            Spec {
+                id: "13".into(),
+                key: "GET api/reports/{year}".into(),
+                case: "happy".into(),
+                unresolved: vec!["year".into()],
+                ..Default::default()
+            },
+        ];
+        write(&work.join("requests.json"), &specs).unwrap();
+        let diff = json!({"removed": [], "added": [],
+            "changed": [{"route": "GET api/admin", "changes": ["middleware: -auth:api"]}]});
+        write(&work.join("routes-diff.json"), &diff).unwrap();
+        let meta =
+            json!({"new": {"info": {"laravel": "11.0", "capabilities": {"broadcasts": false}}}});
+        write(&work.join("run.json"), &meta).unwrap();
+
+        let fixes = write_all(&config).unwrap();
+        let find = |title: &str| {
+            fixes
+                .iter()
+                .find(|f| f.title.starts_with(title))
+                .unwrap_or_else(|| panic!("no fix titled {title}"))
+        };
+        // one crash cause on two routes, pointed at the app's own frame, worst first
+        let crash = &fixes[0];
+        assert_eq!((crash.priority, crash.area.as_str()), (1, "API"));
+        assert!(
+            crash
+                .title
+                .starts_with("Crashes on the new app: TypeError: ")
+        );
+        assert_eq!(crash.routes, ["GET api/orders/{order}", "GET api/orders"]);
+        assert_eq!(
+            crash.location.as_deref(),
+            Some("app/Http/Controllers/OrderController.php:42")
+        );
+        assert!(crash.hint.as_deref().unwrap().starts_with("A type added"));
+        let open = find("1 routes answer WITHOUT signing in");
+        assert_eq!((open.priority, open.area.as_str()), (1, "Access"));
+        assert_eq!(open.details, ["GET api/admin: middleware: -auth:api"]);
+        let lost = find("1 routes the signed-in user could use");
+        assert_eq!(lost.priority, 2);
+        assert!(
+            lost.hint
+                .as_deref()
+                .unwrap()
+                .contains("middleware unchanged")
+        );
+        let unvalidated = find("2 saves the old app refused");
+        assert_eq!(
+            unvalidated.routes,
+            [
+                "POST api/orders (empty body)",
+                "POST api/users (without email)"
+            ]
+        );
+        let refused = find("A save that works on the old app is refused");
+        assert!(refused.title.ends_with("(422 on: phone)"));
+        assert_eq!(refused.routes, ["PUT api/orders/{order}"]);
+        let fields = find("1 answers lost fields");
+        assert_eq!(fields.details, ["GET api/cart: $.data.total"]);
+        // 401/403 and 422 changes have their own items; guest cases too
+        assert_eq!(
+            find("Status 422 -> 201").routes,
+            ["POST api/orders [empty]"]
+        );
+        assert_eq!(
+            find("Status 422 -> 200").routes,
+            ["POST api/users [without-email]"]
+        );
+        assert!(!fixes.iter().any(|f| f.title.contains("200 -> 4")));
+        assert_eq!(
+            find("1 requests write other rows").details,
+            ["POST api/cart: rows: only old wrote orders"]
+        );
+        assert_eq!(
+            find("1 added scenarios").details,
+            ["GET api/reports [ai-1]: 500 on both"]
+        );
+        // what was not checked
+        let caps = find("broadcasts were not compared");
+        assert!(caps.title.contains("the new app (Laravel 11.0)"));
+        assert_eq!(caps.priority, 4);
+        assert_eq!(find("1 routes were not run").area, "Not checked");
+        assert_eq!(find("1 routes fail on both apps").priority, 4);
+        assert_eq!(
+            find("1 saves were refused by validation").details,
+            ["POST api/shops: name: The name field is required."]
+        );
+        // worst first, then the biggest item first
+        assert!(fixes.windows(2).all(|w| w[0].priority <= w[1].priority));
+
+        let md = std::fs::read_to_string(work.join("fixes.md")).unwrap();
+        assert!(md.starts_with("# What to fix: shop\n"));
+        assert!(md.contains("| 1 Fix before release | 2 | 3 |"));
+        assert!(md.contains("\n## 4 Know about\n"));
+        assert!(md.contains("- [ ] **[Access] 1 routes answer WITHOUT signing in"));
+        assert!(md.contains("  - Where: `app/Http/Controllers/OrderController.php:42` (new repo)"));
+        assert!(md.contains("  - Routes (2): `GET api/orders/{order}`, `GET api/orders`\n"));
+        let saved: Vec<Fix> = read(&work.join("fixes.json")).unwrap();
+        assert_eq!(saved.len(), fixes.len());
+        let _ = std::fs::remove_dir_all(work.parent().unwrap());
+    }
+}

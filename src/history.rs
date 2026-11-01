@@ -252,3 +252,259 @@ pub fn overview() -> Res<String> {
     say(&out);
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh tool folder holding pairs/<name>.toml; its runs go to <dir>/runs/<name>.
+    fn pair(dir: &std::path::Path, name: &str) -> Config {
+        let pairs = dir.join("pairs");
+        std::fs::create_dir_all(&pairs).unwrap();
+        let path = pairs.join(format!("{name}.toml"));
+        let toml = format!(
+            "name = \"{name}\"\n[old]\nrepo = '{0}/old'\n[new]\nrepo = '{0}/new'\n[database]\nsource = \"shop\"\n",
+            dir.display()
+        );
+        std::fs::write(&path, toml).unwrap();
+        config::load(&path).unwrap()
+    }
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "laravel-parity-history-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn outcome(id: &str, key: &str, verdict: &str) -> Outcome {
+        serde_json::from_value(json!({"id": id, "key": key, "uri": key, "verdict": verdict,
+                                      "old_status": 200, "new_status": 200, "notes": []}))
+        .unwrap()
+    }
+
+    fn fix(priority: u8) -> Fix {
+        Fix {
+            priority,
+            area: "API".into(),
+            title: "routes fail".into(),
+            location: None,
+            hint: None,
+            routes: vec![],
+            details: vec![],
+        }
+    }
+
+    #[test]
+    fn since_last_run() {
+        let dir = fresh("changes");
+        let config = pair(&dir, "shop");
+        // no previous results: nothing to compare with
+        keep_previous(&config);
+        assert!(changes(&config, &[outcome("1", "GET api/a", "same")]).is_none());
+
+        let before = vec![
+            outcome("1", "GET api/a", "status"),
+            outcome("2", "GET api/b", "same"),
+            outcome("3", "POST api/c", "body"),
+            outcome("4", "GET api/d", "same"),
+        ];
+        write(&config.work.join("results.json"), &before).unwrap();
+        keep_previous(&config);
+        let mut guest = outcome("2", "GET api/b", "status");
+        guest.case = "guest".into();
+        let now = vec![
+            outcome("1", "GET api/a", "same"),
+            guest,
+            outcome("3", "POST api/c", "effects"),
+            outcome("4", "GET api/d", "minor"),
+            outcome("5", "GET api/e", "new-broken"),
+        ];
+        let found = changes(&config, &now).unwrap();
+        assert_eq!(found["fixed"], json!(["GET api/a (status -> same)"]));
+        assert_eq!(
+            found["broken"],
+            json!(["GET api/b [guest] (same -> status)"])
+        );
+        assert_eq!(found["changed"], json!(["POST api/c (body -> effects)"]));
+        assert_eq!(found["before"], json!(crate::ops::counts_line(&before)));
+        assert_eq!(found["now"], json!(crate::ops::counts_line(&now)));
+        let saved: Value = read(&config.work.join("changes.json")).unwrap();
+        assert_eq!(saved, found);
+
+        let text = section(&found);
+        assert!(text.starts_with(
+            "## Since the last run\n\n1 fixed, 1 newly broken, 1 differ in another way.\n\n"
+        ));
+        let at = |s: &str| text.find(s).unwrap();
+        assert!(at("**Newly broken**") < at("**Fixed**"));
+        assert!(at("**Fixed**") < at("**Differ in another way**"));
+        assert!(text.contains("- GET api/a (status -> same)\n"));
+
+        assert_eq!(
+            section(&json!({"fixed": [], "broken": [], "changed": []})),
+            ""
+        );
+        let many: Vec<String> = (0..32).map(|i| format!("GET api/{i}")).collect();
+        let long = section(&json!({"fixed": many}));
+        assert!(long.contains("32 fixed, 0 newly broken"));
+        assert!(long.contains("- GET api/29\n"));
+        assert!(!long.contains("- GET api/30\n"));
+        assert!(long.contains("- … 2 more in changes.json"));
+        assert!(!long.contains("**Newly broken**"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn annotate_under_first_heading() {
+        let dir = fresh("annotate");
+        let path = dir.join("report.md");
+        std::fs::write(&path, "# Report\n\nbody\n").unwrap();
+        annotate(&path, "");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Report\n\nbody\n"
+        );
+        annotate(&path, "## Since\n\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Report\n\n## Since\n\nbody\n"
+        );
+        std::fs::write(&path, "# Only a heading").unwrap();
+        annotate(&path, "S");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Only a headingS");
+        // a missing file stays missing
+        annotate(&dir.join("none.md"), "S");
+        assert!(!dir.join("none.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_one_line_per_run() {
+        let dir = fresh("record");
+        let config = pair(&dir, "shop");
+        let results = vec![
+            outcome("1", "GET api/a", "status"),
+            outcome("2", "GET api/b", "status"),
+            outcome("3", "GET api/c", "same"),
+        ];
+        // no run.json: no clock, no line
+        record(&config, &results, &[]);
+        assert!(history(&config).is_empty());
+
+        write(
+            &config.work.join("run.json"),
+            &json!({"clock": "2026-10-30 09:00:00"}),
+        )
+        .unwrap();
+        record(&config, &results, &[fix(1), fix(0), fix(3), fix(9)]);
+        let lines = history(&config);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["run"], "2026-10-30 09:00:00");
+        assert_eq!(lines[0]["verdicts"], json!({"same": 1, "status": 2}));
+        // priority 0 counts as 1, 9 as 4
+        assert_eq!(lines[0]["fixes"], json!([2, 0, 1, 1]));
+        assert_eq!(bad_count(&lines[0]), 2);
+
+        // a later report of the same run replaces its line
+        record(&config, &results[2..], &[]);
+        let lines = history(&config);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["verdicts"], json!({"same": 1}));
+        assert_eq!(bad_count(&lines[0]), 0);
+
+        write(
+            &config.work.join("run.json"),
+            &json!({"clock": "2026-10-31 09:00:00"}),
+        )
+        .unwrap();
+        record(&config, &results, &[]);
+        let lines = history(&config);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["run"], "2026-10-31 09:00:00");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overview_closest_to_release_first() {
+        let root = fresh("overview");
+        let previous = std::env::var_os("LARAVEL_PARITY_HOME");
+        // SAFETY: no other test in this crate reads LARAVEL_PARITY_HOME while this one runs
+        unsafe { std::env::set_var("LARAVEL_PARITY_HOME", &root) };
+        let empty = overview();
+
+        // alpha: two priority-1 items, first run
+        let alpha = pair(&root, "alpha");
+        write(
+            &alpha.work.join("results.json"),
+            &vec![
+                outcome("1", "GET api/a", "status"),
+                outcome("2", "GET api/b", "same"),
+            ],
+        )
+        .unwrap();
+        write(
+            &alpha.work.join("fixes.json"),
+            &vec![fix(1), fix(1), fix(3)],
+        )
+        .unwrap();
+        // beta: one priority-2 item, two fewer differences than the run before
+        let beta = pair(&root, "beta");
+        write(
+            &beta.work.join("results.json"),
+            &vec![
+                outcome("1", "GET api/a", "body"),
+                outcome("2", "GET api/b", "same"),
+                outcome("3", "GET api/c", "minor"),
+            ],
+        )
+        .unwrap();
+        write(&beta.work.join("fixes.json"), &vec![fix(2)]).unwrap();
+        std::fs::write(
+            beta.work.join("history.jsonl"),
+            "{\"run\":\"1\",\"verdicts\":{\"status\":2,\"body\":1}}\n{\"run\":\"2\",\"verdicts\":{\"body\":1,\"same\":2}}\n",
+        )
+        .unwrap();
+        // gamma: never run; broken: not a pair file; example: the template
+        pair(&root, "gamma");
+        std::fs::write(root.join("pairs/broken.toml"), "name = ").unwrap();
+        std::fs::write(root.join("pairs/example.toml"), "name = ").unwrap();
+        std::fs::write(root.join("pairs/notes.txt"), "x").unwrap();
+        let out = overview();
+
+        match previous {
+            // SAFETY: as above
+            Some(v) => unsafe { std::env::set_var("LARAVEL_PARITY_HOME", v) },
+            None => unsafe { std::env::remove_var("LARAVEL_PARITY_HOME") },
+        }
+
+        assert!(empty.unwrap_err().starts_with("no pair files in"));
+        let out = out.unwrap();
+        assert!(out.starts_with("# Upgrades\n"));
+        let at = |s: &str| {
+            out.find(s)
+                .unwrap_or_else(|| panic!("{s} missing in {out}"))
+        };
+        assert!(at("| beta |") < at("| alpha |"));
+        assert!(at("| alpha |") < at("| gamma |"));
+        assert!(at("| gamma |") < at("broken.toml | pair file error"));
+        assert!(!out.contains("example"));
+        assert!(out.contains(
+            "| 2 of 3 | 1 | 0 / 1 / 0 | 2 fewer differences | 1 priority-2 items left |"
+        ));
+        assert!(out.contains(
+            "| 1 of 2 | 1 | 2 / 0 / 1 | first run | fix the 2 priority-1 items in runs/alpha/fixes.md |"
+        ));
+        assert!(
+            out.contains("| gamma | not run yet | | | | | `laravel-parity all pairs/gamma.toml` |")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("runs/overview.md")).unwrap(),
+            out
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -850,4 +850,235 @@ mod tests {
         assert_eq!(singular("boxes"), "box");
         assert_eq!(singular("staff"), "staff");
     }
+
+    /// A pair file with `extra` appended, loaded the way `run` loads it.
+    fn config(dir: &str, extra: &str) -> Config {
+        let root =
+            std::env::temp_dir().join(format!("laravel-parity-plan-{}-{dir}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("shop.toml");
+        let text = format!(
+            "[old]\nrepo = \"/nowhere/a\"\n[new]\nrepo = \"/nowhere/b\"\n[database]\nsource = \"shop\"\n{extra}"
+        );
+        std::fs::write(&path, text).unwrap();
+        crate::config::load(&path).unwrap()
+    }
+
+    fn spec(key: &str, body: Option<Value>) -> Spec {
+        let (method, uri) = key.split_once(' ').unwrap();
+        Spec {
+            id: request_id(key),
+            key: key.into(),
+            case: "happy".into(),
+            method: method.into(),
+            template: uri.into(),
+            uri: uri.into(),
+            body,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ids_and_names() {
+        let id = request_id("GET api/units");
+        assert_eq!(id.len(), 10);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id, request_id("GET api/units"));
+        assert_ne!(id, request_id("GET api/unit"));
+        // FNV-1a of nothing is its offset basis
+        assert_eq!(request_id(""), "cbf29ce484");
+
+        let mut s = spec("GET api/units", None);
+        assert_eq!(s.name(), "GET api/units");
+        s.case = "guest".into();
+        assert_eq!(s.name(), "GET api/units [guest]");
+
+        // requests.json without a case is the happy one
+        let read: Spec = serde_json::from_value(json!({
+            "id": "a", "key": "GET api/units", "method": "GET", "template": "api/units", "uri": "api/units"
+        }))
+        .unwrap();
+        assert_eq!(read.case, "happy");
+        assert!(!read.custom && read.made.is_none());
+        // empty and default fields stay out of the file
+        let written = serde_json::to_value(&read).unwrap();
+        for key in [
+            "without", "query", "headers", "skip", "note", "custom", "made", "learned",
+        ] {
+            assert!(written.get(key).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn words_and_tables() {
+        assert_eq!(snake("unitId"), "unit_id");
+        assert_eq!(snake("PropertyUnit"), "property_unit");
+        assert_eq!(snake("lease-items"), "lease_items");
+        assert_eq!(plurals("unit"), vec!["units", "unit"]);
+        assert_eq!(plurals("company"), vec!["companies", "companys", "company"]);
+        assert_eq!(plurals("day"), vec!["days", "day"]);
+        assert_eq!(plurals("box"), vec!["boxes", "box"]);
+        assert_eq!(plurals("branch"), vec!["branches", "branch"]);
+
+        assert_eq!(
+            candidate_tables("api/units/{unit}", "unit"),
+            vec!["units", "unit"]
+        );
+        assert_eq!(candidate_tables("api/x/{unit_id}", "unit_id")[0], "units");
+        assert_eq!(candidate_tables("api/x/{unitId}", "unitId")[0], "units");
+        // {id} takes the segment before it
+        // (an already plural segment is tried as written too)
+        assert_eq!(
+            candidate_tables("api/companies/{id}", "id"),
+            vec!["companieses", "companies"]
+        );
+        // two parameters in a row: the last plain segment
+        assert_eq!(
+            candidate_tables("api/leases/{lease}/{id}", "id"),
+            vec!["leaseses", "leases"]
+        );
+        // a compound name also tries its last word
+        assert_eq!(
+            candidate_tables("api/x/{property_unit}", "property_unit"),
+            vec!["property_units", "property_unit", "units", "unit"]
+        );
+
+        assert_eq!(
+            PARAM
+                .captures_iter("api/units/{unit}/leases/{lease?}")
+                .map(|c| (c[1].to_string(), c.get(2).is_some()))
+                .collect::<Vec<_>>(),
+            vec![("unit".into(), false), ("lease".into(), true)]
+        );
+        assert_eq!(
+            SLASHES.replace_all("api/units//leases///", "/"),
+            "api/units/leases/"
+        );
+    }
+
+    #[test]
+    fn typed_bodies() {
+        // no body, or an empty one: nothing to keep
+        assert!(!person_typed(&spec("GET api/units", None)));
+        assert!(!person_typed(&spec("POST api/units", Some(json!({})))));
+
+        // the tool's own body is made again; one that differs was typed
+        let mut s = spec("POST api/units", Some(json!({"name": "parity name"})));
+        s.made = s.body.clone();
+        assert!(!person_typed(&s));
+        s.body = Some(json!({"name": "Block A"}));
+        assert!(person_typed(&s));
+
+        // requests.json from before `made`: the note or the case says the tool made it
+        let mut s = spec("POST api/units", Some(json!({"name": "Block A"})));
+        assert!(person_typed(&s));
+        s.note = Some(json!("body made from the route's validation rules"));
+        assert!(!person_typed(&s));
+        s.note = Some(json!("keep this one"));
+        assert!(person_typed(&s));
+        s.note = None;
+        s.case = "without-name".into();
+        assert!(!person_typed(&s));
+    }
+
+    #[test]
+    fn variants() {
+        let mut s = spec("POST api/units", Some(json!({"name": "parity name"})));
+        s.guard = Some("api".into());
+        s.values.insert("unit".into(), "5".into());
+        s.filled.insert("unit".into(), "5".into());
+        s.skip = Some(json!(true));
+        s.note = Some(json!("a note"));
+        s.without = vec!["name".into()];
+        s.learned = vec!["name: The name field is required.".into()];
+        s.made = s.body.clone();
+
+        let v = variant(&s, "guest");
+        assert_eq!(v.case, "guest");
+        assert_eq!(v.id, request_id("POST api/units#guest"));
+        assert_ne!(v.id, s.id);
+        assert_eq!(v.name(), "POST api/units [guest]");
+        // what belongs to the happy case alone is dropped
+        assert!(v.values.is_empty() && v.skip.is_none() && v.note.is_none());
+        assert!(v.without.is_empty() && v.learned.is_empty());
+        // the request itself is the same
+        assert_eq!(v.body, s.body);
+        assert_eq!(v.made, s.made);
+        assert_eq!(v.filled, s.filled);
+        assert_eq!(v.guard.as_deref(), Some("api"));
+        assert_ne!(variant(&s, "empty").id, v.id);
+    }
+
+    #[test]
+    fn pair_file_params() {
+        let c = config(
+            "params",
+            r#"
+            [params]
+            unit = 5
+            code = "A1"
+            "api/units/{unit}" = { unit = "7" }
+            "GET api/units/{unit}" = { unit = "9" }
+            [auth.headers]
+            my-project-id = 3
+            [run]
+            query = { project_id = "4", page = 2 }
+            body = { company_id = 8, name = "x", owner_id = true }
+            "#,
+        );
+        let get = |key: &str, param: &str| {
+            let uri = key.split_once(' ').unwrap().1;
+            override_value(&c, key, uri, param)
+        };
+        // the route key wins, then the uri, then a value for every route
+        assert_eq!(
+            get("GET api/units/{unit}", "unit"),
+            Some(toml::Value::String("9".into()))
+        );
+        assert_eq!(
+            get("PUT api/units/{unit}", "unit"),
+            Some(toml::Value::String("7".into()))
+        );
+        assert_eq!(
+            get("GET api/leases/{unit}", "unit"),
+            Some(toml::Value::Integer(5))
+        );
+        assert_eq!(
+            get("GET api/units/{code}", "code"),
+            Some(toml::Value::String("A1".into()))
+        );
+        assert_eq!(get("GET api/units/{lease}", "lease"), None);
+        // a route's table is never a value
+        assert_eq!(get("GET api/x/{p}", "api/units/{unit}"), None);
+
+        // the header's project first, then *_id fields of [run] query and body that are text or numbers
+        assert_eq!(
+            default_scope(&c),
+            vec![
+                ("project_id".to_string(), "3".to_string()),
+                ("company_id".to_string(), "8".to_string()),
+            ]
+        );
+        assert!(default_scope(&config("noscope", "")).is_empty());
+    }
+
+    #[test]
+    fn class_names() {
+        let source = "<?php\nnamespace App\\Http\\Controllers;\n\nuse App\\Models\\Unit;\nuse App\\Models;\n";
+        assert_eq!(CodeLookup::class_name("Unit", source), "App\\Models\\Unit");
+        assert_eq!(
+            CodeLookup::class_name("Models\\Lease", source),
+            "App\\Models\\Lease"
+        );
+        assert_eq!(
+            CodeLookup::class_name("\\App\\Models\\Shop", source),
+            "App\\Models\\Shop"
+        );
+        assert_eq!(
+            CodeLookup::class_name("Helper", source),
+            "App\\Http\\Controllers\\Helper"
+        );
+        assert_eq!(CodeLookup::class_name("Helper", "<?php\n"), "Helper");
+    }
 }

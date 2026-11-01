@@ -422,4 +422,223 @@ mod tests {
             ["max:5"]
         );
     }
+
+    #[test]
+    fn paths_make_and_find() {
+        let mut v = json!({"name": "a", "items": "x"});
+        // a scalar on the way becomes a list (next part is an index) or an object
+        set_path(&mut v, "items.1.qty", json!(2));
+        set_path(&mut v, "name.first", json!("b"));
+        set_path(&mut v, "items.0", json!("c"));
+        set_path(&mut v, "grid.0.0", json!(1));
+        assert_eq!(
+            v,
+            json!({"name": {"first": "b"}, "items": ["c", {"qty": 2}], "grid": [[1]]})
+        );
+        set_path(&mut v, "items.1.price", json!(5));
+        assert_eq!(v["items"][1], json!({"qty": 2, "price": 5}));
+        let mut root = json!(null);
+        set_path(&mut root, "tenant.id", json!(7));
+        assert_eq!(root, json!({"tenant": {"id": 7}}));
+
+        assert_eq!(get_path(&v, "items.1.qty"), Some(&json!(2)));
+        assert_eq!(get_path(&v, "grid.0.0"), Some(&json!(1)));
+        assert_eq!(get_path(&v, "items.5"), None);
+        assert_eq!(get_path(&v, "items.x"), None);
+        assert_eq!(get_path(&v, "name.first.more"), None);
+        assert_eq!(get_path(&json!({"0": "zero"}), "0"), Some(&json!("zero")));
+    }
+
+    #[test]
+    fn php_formats() {
+        let clock = "2026-10-31 09:05:07";
+        assert_eq!(php_date("d/m/Y H:i", clock).unwrap(), "31/10/2026 09:05");
+        assert_eq!(
+            php_date("j n y G", "2026-02-03 04:05:06").unwrap(),
+            "3 2 26 4"
+        );
+        assert_eq!(
+            php_date("h:i A", "2026-10-31 21:05:07").unwrap(),
+            "09:05 PM"
+        );
+        assert_eq!(php_date("D, M F", clock).unwrap(), "Sat, Oct October");
+        assert_eq!(php_date("H:i:s.u v", clock).unwrap(), "09:05:07.000000 000");
+        // an escaped letter is kept as it is
+        assert_eq!(php_date("\\Y\\m Y", clock).unwrap(), "Ym 2026");
+        assert_eq!(php_date("Y\\", clock).unwrap(), "2026");
+        assert!(php_date("O", clock).unwrap().len() == 5);
+        assert!(php_date("Y-m-d", "31/10/2026").is_none());
+    }
+
+    #[test]
+    fn rules_from_messages() {
+        let r = |name: &str, message: &str| rules_from(name, message);
+        assert_eq!(r("qty", "The qty must be an integer."), ["integer"]);
+        assert_eq!(r("total", "The total must be a number."), ["integer"]);
+        assert_eq!(
+            r("active", "The active field must be true or false."),
+            ["boolean"]
+        );
+        assert_eq!(r("terms", "The terms must be accepted."), ["boolean"]);
+        assert_eq!(
+            r("contact_email", "The contact email field is required."),
+            ["email"]
+        );
+        assert_eq!(
+            r("owner", "The owner must be a valid email address."),
+            ["email"]
+        );
+        assert_eq!(r("lines", "The lines must be an array."), ["array"]);
+        assert_eq!(
+            r("paid_items", "The paid items field is required."),
+            ["array"]
+        );
+        assert_eq!(
+            r("shipped_at", "The shipped at field is required."),
+            ["date"]
+        );
+        assert_eq!(r("date_from", "The date from field is required."), ["date"]);
+        assert_eq!(r("site", "The site format is invalid URL."), ["url"]);
+        assert_eq!(
+            r(
+                "lines.0.unit_price",
+                "The lines.0.unit_price field is required."
+            ),
+            ["numeric"]
+        );
+        assert_eq!(r("year", "The year field is required."), ["numeric"]);
+        // "rated" is not "rate"
+        assert!(r("rated", "The rated field is required.").is_empty());
+        assert!(r("name", "The name field is required.").is_empty());
+        assert_eq!(
+            r("password", "The password must be at least 8 characters."),
+            ["min:8"]
+        );
+        assert_eq!(
+            r("code", "The code may not be greater than 12 characters."),
+            ["max:12"]
+        );
+        assert_eq!(
+            r("note", "The note must not exceed 255 characters."),
+            ["max:255"]
+        );
+        assert_eq!(
+            r(
+                "count",
+                "The count must be a number and at least 1 characters."
+            ),
+            ["integer", "min:1"]
+        );
+    }
+
+    fn spec(id: &str, case: &str, method: &str, body: Value) -> Spec {
+        serde_json::from_value(
+            json!({"id": id, "key": format!("{method} api/orders"), "case": case,
+            "method": method, "template": "api/orders", "uri": "api/orders", "body": body}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fill_leaves_what_it_cannot_learn_from() {
+        let dir = std::env::temp_dir().join(format!("laravel-parity-learn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pairs")).unwrap();
+        let path = dir.join("pairs/shop.toml");
+        let toml = format!(
+            "name = \"shop\"\n[old]\nrepo = '{0}/old'\n[new]\nrepo = '{0}/new'\n[database]\nsource = \"shop\"\n",
+            dir.display()
+        );
+        std::fs::write(&path, toml).unwrap();
+        let config = crate::config::load(&path).unwrap();
+        let mut skipped = spec("4", "happy", "POST", json!({}));
+        skipped.skip = Some(json!("no id"));
+        let mut specs = vec![
+            spec("1", "happy", "POST", json!({"name": "a"})),
+            spec("2", "guest", "POST", json!({})),
+            spec("3", "without-name", "POST", json!({})),
+            skipped,
+            spec("5", "log-1", "PUT", json!({})),
+        ];
+        let before = serde_json::to_value(&specs).unwrap();
+        // no answers from the old app yet
+        assert!(
+            fill(&config, &mut specs, "2026-10-31 09:00:00")
+                .unwrap()
+                .is_empty()
+        );
+
+        // answered, refused by a caught exception, or refused in a case that should not pass: no Sampler (no MySQL) needed
+        let refused =
+            json!({"message": "invalid", "errors": {"name": ["The name field is required."]}});
+        let rows = [
+            json!({"id": "1", "status": 200, "json": {}}),
+            json!({"id": "2", "status": 422, "json": refused}),
+            json!({"id": "3", "status": 422, "json": refused}),
+            json!({"id": "4", "status": 422, "json": refused}),
+            json!({"id": "5", "status": 500, "json": {"errors": {"general": "boom"}}}),
+        ];
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::create_dir_all(&config.work).unwrap();
+        std::fs::write(config.work.join("results-old.jsonl"), text).unwrap();
+        assert!(
+            fill(&config, &mut specs, "2026-10-31 09:00:00")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(serde_json::to_value(&specs).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_keeps_learned_fields() {
+        let mut from = spec(
+            "1",
+            "happy",
+            "POST",
+            json!({"tenant": {"id": 7}, "password": "secret1", "password_confirmation": "secret1",
+                   "name": "made"}),
+        );
+        from.learned = vec![
+            "tenant.id: The tenant.id field is required.".into(),
+            "password: The password confirmation does not match.".into(),
+            "missing: The missing field is required.".into(),
+            "no separator".into(),
+        ];
+        let (mut body, mut query) = (None, None);
+        carry(&from, &mut body, &mut query);
+        assert_eq!(
+            body,
+            Some(
+                json!({"tenant": {"id": 7}, "password": "secret1", "password_confirmation": "secret1"})
+            )
+        );
+        assert_eq!(query, None);
+
+        // a rebuilt body keeps its own fields; learned ones win
+        let mut body = Some(json!({"name": "new", "tenant": {"id": 1, "kind": "x"}}));
+        carry(&from, &mut body, &mut query);
+        assert_eq!(
+            body,
+            Some(json!({"name": "new", "tenant": {"id": 7, "kind": "x"},
+                        "password": "secret1", "password_confirmation": "secret1"}))
+        );
+
+        // GET: from and into the query
+        let mut get = spec("2", "happy", "GET", json!({"from": "ignored"}));
+        get.query = json!({"from": "2026-10-31", "page": 1})
+            .as_object()
+            .cloned();
+        get.learned = vec!["from: The from does not match the format Y-m-d.".into()];
+        let (mut body, mut query) = (None, Some(Map::new()));
+        carry(&get, &mut body, &mut query);
+        assert_eq!(body, None);
+        assert_eq!(query, json!({"from": "2026-10-31"}).as_object().cloned());
+
+        // nothing learned: nothing changes
+        let plain = spec("3", "happy", "POST", json!({"a": 1}));
+        let mut body = Some(json!({"b": 2}));
+        carry(&plain, &mut body, &mut query);
+        assert_eq!(body, Some(json!({"b": 2})));
+    }
 }

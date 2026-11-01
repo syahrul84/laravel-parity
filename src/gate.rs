@@ -209,4 +209,187 @@ mod tests {
         )));
         assert_eq!(entries(&fixes, 1).len(), 2);
     }
+
+    fn fix(priority: u8, title: &str, routes: &[&str], details: &[&str]) -> Fix {
+        Fix {
+            priority,
+            area: "API".into(),
+            title: title.into(),
+            location: None,
+            hint: None,
+            routes: routes.iter().map(|r| r.to_string()).collect(),
+            details: details.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    /// A fresh folder holding pairs/shop.toml; its runs go to <dir>/runs/shop.
+    fn pair(name: &str) -> (PathBuf, Config) {
+        let dir =
+            std::env::temp_dir().join(format!("laravel-parity-gate-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pairs")).unwrap();
+        let path = dir.join("pairs/shop.toml");
+        let toml = format!(
+            "name = \"shop<&>\"\nwork = '{0}/runs/shop'\n[old]\nrepo = '{0}/old'\n[new]\nrepo = '{0}/new'\n[database]\nsource = \"shop\"\n",
+            dir.display()
+        );
+        std::fs::write(&path, toml).unwrap();
+        let config = crate::config::load(&path).unwrap();
+        (dir, config)
+    }
+
+    #[test]
+    fn entries_cover_every_shape() {
+        let fixes = vec![
+            fix(2, "Mail changed", &[], &[]),
+            fix(2, "Mail changed", &[], &[]),
+            fix(4, "Not checked", &[], &["job 12"]),
+            fix(
+                1,
+                "4 routes fail",
+                &["GET api/orders/{order}"],
+                &["ignored 1"],
+            ),
+        ];
+        let all = entries(&fixes, 4);
+        assert_eq!(all.len(), 3);
+        // ordered by priority first
+        let list: Vec<_> = all.iter().cloned().collect();
+        assert_eq!(
+            list,
+            vec![
+                (1, "[API] # routes fail: GET api/orders/{order}".to_string()),
+                (2, "[API] Mail changed".to_string()),
+                (4, "[API] Not checked: job #".to_string()),
+            ]
+        );
+        assert_eq!(entries(&fixes, 2).len(), 2);
+        assert!(entries(&fixes, 0).is_empty());
+        assert!(entries(&[], 4).is_empty());
+        assert_eq!(xml("a<b>&\"c\""), "a&lt;b&gt;&amp;&quot;c&quot;");
+    }
+
+    #[test]
+    fn baseline_then_gate() {
+        let (dir, config) = pair("ci");
+        // every ci() call appends to the GitHub job summary: keep it in this folder (on GitHub Actions too)
+        let file = dir.join("summary.md");
+        let previous = std::env::var_os("GITHUB_STEP_SUMMARY");
+        // SAFETY: only gate::ci reads GITHUB_STEP_SUMMARY, and only this test calls it
+        unsafe { std::env::set_var("GITHUB_STEP_SUMMARY", &file) };
+        assert_eq!(
+            baseline(&config, None).unwrap_err(),
+            "no fix list yet: run the checks first"
+        );
+        assert!(ci(&config, true, false, 1, None).is_err());
+
+        write(
+            &config.work.join("fixes.json"),
+            &vec![
+                fix(1, "3 routes fail", &["GET api/a", "GET api/b"], &[]),
+                fix(3, "Slower", &[], &["GET api/c: 10 -> 90 queries"]),
+            ],
+        )
+        .unwrap();
+        let said = baseline(&config, None).unwrap();
+        assert!(said.starts_with("3 findings accepted in "));
+        assert!(said.ends_with("baseline.json"));
+        let saved: Value = read(&config.work.join("baseline.json")).unwrap();
+        assert_eq!(saved["accepted"].as_array().unwrap().len(), 3);
+
+        // counts and timings move between runs: still the same findings
+        write(
+            &config.work.join("fixes.json"),
+            &vec![
+                fix(1, "5 routes fail", &["GET api/a", "GET api/b"], &[]),
+                fix(3, "Slower", &[], &["GET api/c: 11 -> 95 queries"]),
+            ],
+        )
+        .unwrap();
+        let pass = ci(&config, true, false, 3, None).unwrap();
+        assert_eq!(
+            pass,
+            "PASS: no new findings at priority 3 or worse (3 findings in all, 3 accepted)"
+        );
+
+        // the same cause reaching one more route is new; a new priority-3 item only fails a gate at 3
+        write(
+            &config.work.join("fixes.json"),
+            &vec![
+                fix(
+                    1,
+                    "6 routes fail",
+                    &["GET api/a", "GET api/b", "GET api/<x>&"],
+                    &[],
+                ),
+                fix(3, "Slower", &[], &["GET api/d: 1 -> 2 queries"]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            ci(&config, true, false, 1, None).unwrap_err(),
+            "FAIL: 1 new findings at priority 1 or worse"
+        );
+        assert_eq!(
+            ci(&config, true, false, 3, None).unwrap_err(),
+            "FAIL: 2 new findings at priority 3 or worse"
+        );
+        let junit = std::fs::read_to_string(config.work.join("junit.xml")).unwrap();
+        assert!(junit.contains(
+            "<testsuite name=\"laravel-parity shop&lt;&amp;&gt;\" tests=\"4\" failures=\"2\">"
+        ));
+        assert!(junit.contains(
+            "<testcase classname=\"laravel-parity.priority-1\" name=\"[API] # routes fail: GET api/&lt;x&gt;&amp;\"><failure message=\"priority 1\">"
+        ));
+        assert!(junit.contains(
+            "name=\"[API] # routes fail: GET api/a\"><skipped message=\"accepted in the baseline\"/></testcase>"
+        ));
+        assert!(junit.contains(
+            "name=\"[API] Slower: GET api/d: # -&gt; # queries\"><failure message=\"priority 3\">"
+        ));
+        // gate at 1: the new priority-3 item is neither failed nor skipped
+        ci(&config, true, false, 1, None).unwrap_err();
+        let junit = std::fs::read_to_string(config.work.join("junit.xml")).unwrap();
+        assert!(junit.contains("name=\"[API] Slower: GET api/d: # -&gt; # queries\"></testcase>"));
+
+        // a baseline in another file: the default one is not read
+        let other = dir.join("accepted.json");
+        assert!(
+            baseline(&config, Some(&other))
+                .unwrap()
+                .starts_with("4 findings accepted")
+        );
+        assert!(ci(&config, true, false, 4, Some(&other)).is_ok());
+        let _ = std::fs::remove_file(config.work.join("baseline.json"));
+        assert_eq!(
+            ci(&config, true, false, 4, None).unwrap_err(),
+            "FAIL: 4 new findings at priority 4 or worse"
+        );
+
+        // the job summary lists the first 50 new findings
+        let fixes: Vec<Fix> = (0..52)
+            .map(|i| fix(1, "Broken", &[&format!("GET api/r{i:02}")], &[]))
+            .collect();
+        write(&config.work.join("fixes.json"), &fixes).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let result = ci(&config, true, false, 2, None);
+        match previous {
+            // SAFETY: as above
+            Some(v) => unsafe { std::env::set_var("GITHUB_STEP_SUMMARY", v) },
+            None => unsafe { std::env::remove_var("GITHUB_STEP_SUMMARY") },
+        }
+        assert_eq!(
+            result.unwrap_err(),
+            "FAIL: 52 new findings at priority 2 or worse"
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with(
+            "## laravel-parity: shop<&>\n\nFAIL: 52 new findings at priority 2 or worse\n\n"
+        ));
+        assert!(text.contains("- priority 1: [API] Broken: GET api/r49\n"));
+        assert!(!text.contains("GET api/r50"));
+        assert!(text.contains("- … 2 more in "));
+        assert!(text.trim_end().ends_with("junit.xml"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

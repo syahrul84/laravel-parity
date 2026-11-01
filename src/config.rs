@@ -399,3 +399,261 @@ pub fn load(path: &Path) -> Result<Config, String> {
         console: raw.console,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `text` as `<dir>/pairs/<file>` in a fresh temp folder and returns the pair file's path.
+    fn pair(dir: &str, file: &str, text: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "laravel-parity-config-{}-{dir}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pairs")).unwrap();
+        let path = root.join("pairs").join(file);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn defaults() {
+        let path = pair(
+            "defaults",
+            "shop.toml",
+            r#"
+            [old]
+            repo = "/nowhere/shop-old"
+            container = "shop-old-php"
+            [new]
+            repo = "/nowhere/shop-new"
+            [database]
+            source = "shop"
+            "#,
+        );
+        let c = load(&path).unwrap();
+        assert_eq!(c.name, "shop");
+        assert_eq!(c.old.database, "shop_parity_old");
+        assert_eq!(c.new.database, "shop_parity_new");
+        assert_eq!(c.source_db, "shop");
+        assert_eq!(c.db_user, "root");
+        let root = path.canonicalize().unwrap();
+        let root = root.parent().unwrap().parent().unwrap();
+        assert_eq!(c.work, root.join("runs").join("shop"));
+        assert_eq!(c.clock, "auto");
+        assert_eq!(c.include, vec!["api/*"]);
+        assert!(c.exclude.is_empty());
+        assert_eq!(c.methods, vec!["GET", "POST", "PUT", "PATCH", "DELETE"]);
+        assert_eq!((c.batch, c.workers, c.learn), (100, 4, 4));
+        assert_eq!(c.cases, vec!["happy", "guest", "missing", "validation"]);
+        assert_eq!(c.missing_id, "999999999");
+        assert!(c.ignore_keys.iter().any(|k| k == "*_token"));
+        assert!(c.unordered_lists);
+        assert!(c.masks.is_empty());
+        assert_eq!(c.tests.dir(), "tests/Feature/Parity");
+        assert!(c.console.run);
+        assert_eq!(c.console.timeout, 120);
+        assert!(c.web_old.is_none() && c.web_new.is_none());
+
+        // old runs in Docker: the container's app path and host.docker.internal
+        assert!(matches!(&c.old.php, Php::Docker { container } if container == "shop-old-php"));
+        assert_eq!(c.old.app_path, "/opt/localhost/api");
+        assert_eq!(c.old.db_host, "127.0.0.1");
+        assert_eq!(c.old.db_app_host, "host.docker.internal");
+        assert_eq!(c.old.db_port, 3306);
+        assert_eq!(c.old.label, "old");
+        // new runs on local php: the repo is the app path, the app reaches MySQL on the same host
+        assert!(matches!(&c.new.php, Php::Local { php } if php == "php"));
+        assert_eq!(c.new.app_path, "/nowhere/shop-new");
+        assert_eq!(c.new.db_app_host, "127.0.0.1");
+        assert_eq!(c.new.label, "new");
+    }
+
+    #[test]
+    fn overrides() {
+        let path = pair(
+            "overrides",
+            "ignored.toml",
+            r#"
+            name = "shop"
+            work = "/nowhere/runs"
+            [old]
+            repo = "/nowhere/shop-old"
+            container = "shop-old-php"
+            app_path = "/var/www/shop"
+            setup = ["php artisan cache:clear"]
+            [old.database]
+            host = "db.example.com"
+            port = 3307
+            container_host = "mysql"
+            [new]
+            repo = "/nowhere/shop-new"
+            php = "/usr/local/bin/php8"
+            app_path = "/ignored/when/local"
+            [database]
+            source = "shop_live"
+            old = "shop_parity_a"
+            new = "parity_shop_b"
+            user = "tester"
+            port = 3308
+            app_host = "10.0.0.2"
+            [auth.users]
+            web = 1
+            [auth.headers]
+            my-project-id = "7"
+            [run]
+            clock = "2026-01-01 00:00:00"
+            include = ["*"]
+            exclude = ["api/health"]
+            methods = ["get", "post"]
+            batch = 0
+            workers = 0
+            learn = 0
+            cases = ["happy"]
+            missing_id = "0"
+            query = { project_id = 7 }
+            body = { company_id = "3" }
+            [compare]
+            ignore_keys = ["id"]
+            unordered_lists = false
+            mask = ["data.*.uuid"]
+            [params]
+            unit = 5
+            [tests]
+            dir = "tests/Parity"
+            [web]
+            old = "/nowhere/web-old"
+            [console]
+            run = false
+            skip = ["queue:*"]
+            "#,
+        );
+        let c = load(&path).unwrap();
+        assert_eq!(c.name, "shop");
+        assert_eq!(c.work, PathBuf::from("/nowhere/runs"));
+        assert_eq!(c.old.database, "shop_parity_a");
+        assert_eq!(c.new.database, "parity_shop_b");
+        assert_eq!(c.source_db, "shop_live");
+        assert_eq!(c.db_user, "tester");
+        // a side's own database settings win over the shared ones
+        assert_eq!(c.old.db_host, "db.example.com");
+        assert_eq!(c.old.db_port, 3307);
+        assert_eq!(c.old.db_app_host, "mysql");
+        assert_eq!(c.old.app_path, "/var/www/shop");
+        assert_eq!(
+            c.old.setup,
+            vec![serde_json::json!("php artisan cache:clear")]
+        );
+        assert_eq!(c.new.db_host, "127.0.0.1");
+        assert_eq!(c.new.db_port, 3308);
+        assert_eq!(c.new.db_app_host, "10.0.0.2");
+        assert!(matches!(&c.new.php, Php::Local { php } if php == "/usr/local/bin/php8"));
+        assert_eq!(c.new.app_path, "/nowhere/shop-new");
+        assert_eq!(c.users["web"], serde_json::json!(1));
+        assert_eq!(c.headers["my-project-id"], serde_json::json!("7"));
+        assert_eq!(c.clock, "2026-01-01 00:00:00");
+        assert_eq!(c.include, vec!["*"]);
+        assert_eq!(c.exclude, vec!["api/health"]);
+        assert_eq!(c.methods, vec!["GET", "POST"]);
+        // 0 batch and workers would never send anything
+        assert_eq!((c.batch, c.workers, c.learn), (1, 1, 0));
+        assert_eq!(c.cases, vec!["happy"]);
+        assert_eq!(c.missing_id, "0");
+        assert_eq!(c.default_query["project_id"], serde_json::json!(7));
+        assert_eq!(c.default_body["company_id"], serde_json::json!("3"));
+        assert_eq!(c.ignore_keys, vec!["id"]);
+        assert!(!c.unordered_lists);
+        assert_eq!(c.masks, vec!["data.*.uuid"]);
+        assert_eq!(c.params["unit"], toml::Value::Integer(5));
+        assert_eq!(c.tests.dir(), "tests/Parity");
+        assert_eq!(c.web_old, Some(PathBuf::from("/nowhere/web-old")));
+        assert!(c.web_new.is_none());
+        assert!(!c.console.run);
+        assert_eq!(c.console.timeout, 120);
+        assert_eq!(c.console.skip, vec!["queue:*"]);
+    }
+
+    #[test]
+    fn refusals() {
+        let sides = "[old]\nrepo = \"/nowhere/a\"\n[new]\nrepo = \"/nowhere/b\"\n";
+        // a test database without "parity" in its name is never dropped
+        let path = pair(
+            "unsafe",
+            "shop.toml",
+            &format!("{sides}[database]\nsource = \"shop\"\nnew = \"shop_copy\"\n"),
+        );
+        let err = load(&path).unwrap_err();
+        assert!(
+            err.contains("'shop_copy'") && err.contains("parity"),
+            "{err}"
+        );
+        // the source cannot be one of the test databases
+        let path = pair(
+            "same",
+            "shop.toml",
+            &format!("{sides}[database]\nsource = \"shop_parity_old\"\n"),
+        );
+        assert!(load(&path).unwrap_err().contains("database.source"));
+        // no source and no old .env to read DB_DATABASE from
+        let path = pair("nosource", "shop.toml", sides);
+        assert!(load(&path).unwrap_err().contains("DB_DATABASE"));
+        // bad TOML, a missing side and a missing file name the file
+        let path = pair("bad", "shop.toml", "[old\nrepo = 1");
+        assert!(load(&path).unwrap_err().contains("shop.toml"));
+        let path = pair("noside", "shop.toml", "[old]\nrepo = \"/nowhere/a\"\n");
+        assert!(load(&path).unwrap_err().contains("new"));
+        assert!(load(Path::new("/nowhere/missing.toml")).is_err());
+    }
+
+    #[test]
+    fn env_file() {
+        let repo =
+            std::env::temp_dir().join(format!("laravel-parity-config-{}-env", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".env"),
+            "APP_NAME=Shop\nDB_DATABASE=\"shop\"\nDB_USERNAME='shop_user'\nDB_PASSWORD=  secret  \nDB_HOST=\n",
+        )
+        .unwrap();
+        assert_eq!(env_value(&repo, "DB_DATABASE").as_deref(), Some("shop"));
+        assert_eq!(
+            env_value(&repo, "DB_USERNAME").as_deref(),
+            Some("shop_user")
+        );
+        assert_eq!(env_value(&repo, "DB_PASSWORD").as_deref(), Some("secret"));
+        assert_eq!(env_value(&repo, "DB_HOST").as_deref(), Some(""));
+        // a key is matched whole, not as a prefix of another
+        assert_eq!(env_value(&repo, "DB"), None);
+        assert_eq!(env_value(&repo, "APP_KEY"), None);
+        assert_eq!(env_value(Path::new("/nowhere"), "DB_DATABASE"), None);
+
+        // without database.source / user, the old repo's .env fills them
+        let path = pair(
+            "fromenv",
+            "shop.toml",
+            &format!(
+                "[old]\nrepo = {:?}\n[new]\nrepo = \"/nowhere/b\"\n",
+                repo.to_string_lossy()
+            ),
+        );
+        let c = load(&path).unwrap();
+        assert_eq!(c.source_db, "shop");
+        assert_eq!(c.db_user, "shop_user");
+        assert_eq!(c.old.repo, repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn home_paths() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        assert_eq!(expand("~/code/shop"), Path::new(&home).join("code/shop"));
+        assert_eq!(expand("~\\code"), Path::new(&home).join("code"));
+        assert_eq!(expand("/srv/shop"), PathBuf::from("/srv/shop"));
+        assert_eq!(expand("code/~/shop"), PathBuf::from("code/~/shop"));
+        // only "~/" is the home folder, not "~user"
+        assert_eq!(expand("~shop"), PathBuf::from("~shop"));
+    }
+}
