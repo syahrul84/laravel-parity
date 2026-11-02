@@ -114,6 +114,8 @@ pub struct Tests {
     pub unit_base_class: Option<String>,
     /// the line coverage of app/ to reach; the report shows how far off it is
     pub target: Option<f64>,
+    /// write a factory for each model that uses HasFactory but has none (Laravel 8+); default on
+    pub factories: Option<bool>,
 }
 
 impl Tests {
@@ -143,6 +145,10 @@ impl Tests {
 
     pub fn target(&self) -> f64 {
         self.target.unwrap_or(80.0)
+    }
+
+    pub fn factories(&self) -> bool {
+        self.factories.unwrap_or(true)
     }
 }
 

@@ -78,29 +78,51 @@ pub fn write(
         route_diff.changed.len()
     );
     if let Some(t) = tests {
+        // routes, test cases and methods are counted apart: they are different things
+        let ran = |c: &Value| match c["made"].as_u64() {
+            Some(made) => format!(
+                "{made} made, {} pass, {} fail{}",
+                c["passed"],
+                c["failed"],
+                match c["not_run"].as_u64() {
+                    Some(n) if n > 0 => format!(", {n} did not run"),
+                    _ => String::new(),
+                }
+            ),
+            None => "not run".into(),
+        };
+        let r = &t["routes"];
         let _ = writeln!(
             out,
-            "\nPHPUnit: {} shared routes had no test; {} tests generated in `{}`, {} pass, {} fail, {} could not be \
-             generated (see tests.md).",
-            t["untested"],
-            t["generated"],
+            "\nPHPUnit, in `{}`: {} of {} shared routes had no test someone wrote. Feature test cases: {}; {} routes got \
+             generated tests, {} with a passing case; {} routes could not get one. Unit tests (one per method): {}; {} \
+             methods could not get one (see tests.md).",
             t["dir"].as_str().unwrap_or_default(),
-            t["passed"],
-            t["failed"],
-            t["cannot"]
+            t["untested"],
+            r["shared"],
+            ran(&t["feature_cases"]),
+            r["with_generated"],
+            r["passing"],
+            t["cannot_routes"],
+            ran(&t["unit_tests"]),
+            t["cannot_methods"]
         );
         if let (Some(shared), Some(before), Some(after)) = (
-            t["routes"]["shared"].as_u64().filter(|n| *n > 0),
-            t["routes"]["tested_before"].as_u64(),
-            t["routes"]["tested_after"].as_u64(),
+            r["shared"].as_u64().filter(|n| *n > 0),
+            r["tested_before"].as_u64(),
+            r["tested_after"].as_u64(),
         ) {
             let share = |n: u64| (n as f64 * 1000.0 / shared as f64).round() / 10.0;
             let _ = writeln!(
                 out,
-                "Routes with a test: {before} of {shared} ({}%) before, {after} ({}%) with the generated tests.",
+                "Routes with a test: {before} of {shared} ({}%) by tests someone wrote; {after} ({}%) with the passing \
+                 generated ones.",
                 share(before),
                 share(after)
             );
+        }
+        if let Some(line) = t["factories"].as_str() {
+            let _ = writeln!(out, "{line}");
         }
         if let Some(line) = crate::coverage::line(&t["coverage"]) {
             let _ = writeln!(out, "{line}");
@@ -264,8 +286,12 @@ mod tests {
                 why: "no value for a".into(),
             },
         ];
-        let tests = json!({"untested": 3, "generated": 2, "dir": "tests/Feature/Parity",
-                           "passed": 1, "failed": 1, "cannot": 0});
+        let tests = json!({"untested": 3, "dir": "tests/Feature/Parity", "cannot_routes": 1, "cannot_methods": 4,
+                           "feature_cases": {"made": 2, "passed": 1, "failed": 1, "not_run": 0},
+                           "unit_tests": {"made": 5, "passed": 4, "failed": 0, "not_run": 1},
+                           "routes": {"shared": 10, "tested_before": 7, "tested_after": 8, "with_generated": 2,
+                                      "passing": 1},
+                           "factories": "Factories: 2 factories written and checked."});
         let path = dir.join("report.md");
         write(
             &path,
@@ -290,7 +316,11 @@ mod tests {
         assert!(
             md.contains("only in the new app: **1**, controller or middleware changed: **3**.")
         );
-        assert!(md.contains("PHPUnit: 3 shared routes had no test; 2 tests generated in `tests/Feature/Parity`, 1 pass"));
+        assert!(md.contains(
+            "PHPUnit, in `tests/Feature/Parity`: 3 of 10 shared routes had no test someone wrote. Feature test cases: 2 made, 1 pass, 1 fail; 2 routes got generated tests, 1 with a passing case; 1 routes could not get one. Unit tests (one per method): 5 made, 4 pass, 0 fail, 1 did not run; 4 methods could not get one (see tests.md)."
+        ));
+        assert!(md.contains("Routes with a test: 7 of 10 (70%) by tests someone wrote; 8 (80%) with the passing generated ones."));
+        assert!(md.contains("Factories: 2 factories written and checked."));
         // each verdict but "same" lists its requests, sorted by route
         assert!(!md.contains("## Same"));
         assert!(md.contains("## Different status code (1)\n\n- **GET api/orders [guest]** `api/orders` (401 → 200)\n  - auth dropped\n"));

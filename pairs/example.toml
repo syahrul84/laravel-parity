@@ -89,14 +89,16 @@ skip = []                  # names or classes not to run, e.g. ["app:import-*", 
 # "App\Jobs\SendInvoice" = { invoice = 42 }
 
 [tests]
-# "mirror": next to the app's own tests, following app/ (tests/Feature/Controllers/Admin/UnitControllerParityTest.php,
-# tests/Unit/Models/UnitParityTest.php); "folder": every feature test in dir with namespace
+# "mirror": next to the app's own tests, following app/ (tests/Feature/Controllers/Admin/UnitControllerTest.php,
+# tests/Unit/Models/UnitTest.php; a file that is already there gets the generated tests in a block at the end of its
+# class); "folder": every feature test in dir with namespace
 layout = "mirror"
 # dir = "tests/Feature/Parity"
 # namespace = "Tests\\Feature\\Parity"
 base_class = "Tests\\TestCase"        # feature tests
 unit_base_class = "Tests\\TestCase"   # unit tests (they need the app booted)
 target = 80                            # line coverage of app/ to reach
+# factories = false                    # do not write factories for the models that have none (Laravel 8+)
 phpunit = "php vendor/bin/phpunit"
 # measure the lines of app/ covered by the app's own tests and with the generated ones (needs pcov or Xdebug in the
 # new app's PHP; the own suite runs once and is reused until app/, tests/, database/, routes/ or config/ change)

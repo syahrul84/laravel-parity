@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, Side};
 use crate::runner;
 use crate::say;
-use crate::testgen;
+use crate::{testfile, testgen};
 
 const COVERAGE_PHP: &str = include_str!("../php/coverage.php");
 
@@ -145,16 +145,21 @@ pub fn fingerprint(repo: &Path, driver: Driver) -> String {
         let Ok(bytes) = std::fs::read(&file) else {
             continue;
         };
+        // the generated tests and the AI-written ones are not the app's own: a file the tool made, a file of AI tests
+        // only, and the blocks they have in the app's own test files do not count
+        let mut kept = bytes;
         if file.extension().is_some_and(|e| e == "php") {
-            let text = String::from_utf8_lossy(&bytes);
-            if text.contains(testgen::MARKER) || text.contains(testgen::AI_GROUP) {
+            let text = String::from_utf8_lossy(&kept).into_owned();
+            let own = testfile::strip(&text);
+            if testfile::owned(&text) || (own.contains(testgen::AI_GROUP) && own == text) {
                 continue;
             }
+            kept = own.into_bytes();
         }
         let rel = file.strip_prefix(repo).unwrap_or(&file);
         hash.update(rel.to_string_lossy().replace('\\', "/"));
         hash.update([0]);
-        hash.update(&bytes);
+        hash.update(&kept);
         hash.update([0]);
     }
     format!("{:x}", hash.finalize())
@@ -352,9 +357,7 @@ pub fn gaps(config: &Config, filter: Option<&str>, limit: usize) -> Result<Value
         } else {
             crate::layout::Kind::Unit
         };
-        let mut place = crate::layout::place(config, kind, &class);
-        place.class = place.class.replace("ParityTest", "CoverageTest");
-        place.file = place.file.with_file_name(format!("{}.php", place.class));
+        let place = crate::layout::place(config, kind, &class);
         gap["test_file"] = json!(
             place
                 .file
@@ -363,7 +366,13 @@ pub fn gaps(config: &Config, filter: Option<&str>, limit: usize) -> Result<Value
                 .to_string_lossy()
                 .replace('\\', "/")
         );
-        gap["test_class"] = json!(place.fqcn());
+        // the class already in that file (the app's own test, or the generated one), else the one to make
+        gap["test_class"] = json!(
+            std::fs::read_to_string(&place.file)
+                .ok()
+                .and_then(|t| testfile::class_of(&t))
+                .unwrap_or_else(|| place.fqcn())
+        );
     }
     Ok(found)
 }
@@ -404,7 +413,13 @@ fn run_ai(config: &Config, driver: Driver, script: &str, files: &[String]) -> Ai
         merge(side, script, &total, std::slice::from_ref(&part));
     } else {
         for file in files {
-            testgen::phpunit(config, &[file], &mut results, Some((driver, &part)));
+            // only the AI-written tests: the file may hold the app's own and generated ones too
+            testgen::phpunit(
+                config,
+                &["--group", testgen::AI_GROUP, file],
+                &mut results,
+                Some((driver, &part)),
+            );
             merge(side, script, &total, std::slice::from_ref(&part));
         }
     }
@@ -430,7 +445,7 @@ fn run_ai(config: &Config, driver: Driver, script: &str, files: &[String]) -> Ai
 /// totals, and say how far the app is from the target.
 pub fn check_tests(config: &Config, files: &[String]) -> Result<Value, String> {
     if files.is_empty() {
-        return Err("name the test files to run (paths in the new repo, e.g. tests/Unit/Models/UnitCoverageTest.php)".into());
+        return Err("name the test files to run (paths in the new repo, e.g. tests/Unit/Models/UnitTest.php)".into());
     }
     runner::ensure_ready(&config.new)?;
     let driver = driver(&config.new).ok_or_else(missing_note)?;
@@ -659,7 +674,41 @@ mod tests {
         std::fs::write(root.join("tests/Feature/ShopTest.php"), "<?php // mine").unwrap();
         let second = fingerprint(root, Driver::Pcov);
         assert_ne!(first, second);
+        // the generated block in the app's own test file does not count; what is outside it does
+        let mine = "<?php\nclass ShopTest extends TestCase\n{\n    public function test_mine(): void {}\n}\n";
+        let place = crate::layout::Place {
+            file: root.join("tests/Feature/ShopTest.php"),
+            namespace: "Tests\\Feature".into(),
+            class: "ShopTest".into(),
+        };
+        std::fs::write(&place.file, mine).unwrap();
+        let third = fingerprint(root, Driver::Pcov);
+        let with_block = testfile::render(
+            Some(mine),
+            &place,
+            &[],
+            "Tests\\TestCase",
+            &["public function test_generated(): void {}".into()],
+        );
+        std::fs::write(&place.file, &with_block).unwrap();
+        assert_eq!(third, fingerprint(root, Driver::Pcov));
+        std::fs::write(
+            &place.file,
+            with_block.replace("test_mine", "test_mine_changed"),
+        )
+        .unwrap();
+        assert_ne!(third, fingerprint(root, Driver::Pcov));
+        // a file of AI-written tests only
+        std::fs::write(
+            root.join("tests/Feature/ShopAiTest.php"),
+            format!(
+                "<?php #[Group('{}')] class ShopAiTest {{}}",
+                testgen::AI_GROUP
+            ),
+        )
+        .unwrap();
+        let fourth = fingerprint(root, Driver::Pcov);
         std::fs::write(root.join("app/Models/Shop.php"), "<?php class Shop { }").unwrap();
-        assert_ne!(second, fingerprint(root, Driver::Pcov));
+        assert_ne!(fourth, fingerprint(root, Driver::Pcov));
     }
 }

@@ -20,12 +20,19 @@ runner each app's own PHP executes (embedded in the binary with `include_str!`).
   (`compare::rejected`); a happy / log- / rec- case both apps refuse is verdict `rejected`. `Spec.made` is the body
   the tool generated: a body that differs from it was typed by a person and every plan keeps it.
 - `tests` measures coverage with the new app's own pcov/Xdebug (`src/coverage.rs`, `php/coverage.php`, same PHP 7.1
-  rule): the app's own tests with `--exclude-group laravel-parity` (every generated class is in that group), cached
+  rule): the app's own tests with `--exclude-group laravel-parity` (every generated method is in that group), cached
   by a fingerprint of app/, tests/, database/, routes/, config/; then the generated tests while they run anyway.
 - Generated tests mirror app/ next to the app's own (`src/layout.rs`; `[tests] layout = "folder"` keeps one folder):
   feature tests per controller, unit tests per class from `units` (`src/units.rs`, replay.php modes units/probe: every
-  public method of app/ classes run on both apps). The AI loop: coverage_gaps -> write a test in group
-  laravel-parity-ai -> check_tests, with probe_code to ask both apps; target `[tests] target` (default 80).
+  public method of app/ classes run on both apps). No "Parity" in file, class or method names. A file the tool made
+  has MARKER in its class docblock; in a test file someone wrote, the generated tests sit in a block
+  (`src/testfile.rs`: `// <laravel-parity>` ... `// </laravel-parity>`) that each run replaces, and the coverage
+  fingerprint and the "route has a test" check ignore. Every generated method carries the group, not the class.
+- `src/factories.rs` writes a factory for each HasFactory model without one (Laravel 8+, MARKER, checked by making a
+  row through probe mode on the new app; a database error fixes the column it names, else the factory is not kept).
+- The AI loop: coverage_gaps -> write a test in group laravel-parity-ai, inside a `// <laravel-parity-ai>` block in
+  test_file -> check_tests, with probe_code to ask both apps; target `[tests] target` (default 80).
+- Summary lines count routes, test cases and methods apart and must add up; never sum different kinds.
 - `src/ops.rs` holds every step and returns `Result`; never exit the process or print to stdout there (the MCP
   server uses stdout for the protocol). Progress goes through `crate::say`.
 - `pairs/` and `runs/` are git-ignored except `pairs/example.toml`: real pair files name private hosts and databases.

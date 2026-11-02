@@ -15,9 +15,9 @@ use crate::config::Config;
 use crate::coverage::{self, Driver};
 use crate::db::TableInfo;
 use crate::glob;
-use crate::layout::{self, Kind, Place};
+use crate::layout::{self, Kind};
 use crate::plan::{PARAM, Spec, plurals, snake};
-use crate::runner;
+use crate::{runner, testfile};
 
 /// Characters a PHP variable name cannot have.
 static NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\W").unwrap());
@@ -37,7 +37,19 @@ struct ClassInfo {
     parent: Option<String>,
     table: Option<String>,
     has_factory: bool,
+    own_factory: bool,
+    abstract_class: bool,
     uses: HashMap<String, String>,
+    file: PathBuf,
+}
+
+/// A model that uses HasFactory but has no factory class: the factory `factories` can write.
+pub struct NoFactory {
+    pub class: String,
+    pub table: String,
+    pub file: PathBuf,
+    /// short class name -> full name, from the model's use statements
+    pub uses: HashMap<String, String>,
 }
 
 /// Table -> model class with a factory, read from the new repo's source.
@@ -59,62 +71,108 @@ fn php_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The classes of app/ and the factory class names of database/factories.
+fn scan(repo: &Path) -> (HashMap<String, ClassInfo>, HashSet<String>) {
+    static CLASS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\s*((?:abstract\s+|final\s+)*)class\s+(\w+)(?:\s+extends\s+([\w\\]+))?")
+            .unwrap()
+    });
+    static NAMESPACE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").unwrap());
+    static TABLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\$table\s*=\s*['"]([\w.]+)['"]"#).unwrap());
+    static USE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*use\s+([\w\\]+?\\(\w+))\s*;").unwrap());
+
+    let mut files = vec![];
+    php_files(&repo.join("app"), &mut files);
+    let mut classes: HashMap<String, ClassInfo> = HashMap::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Some(cap) = CLASS.captures(&text) else {
+            continue;
+        };
+        let namespace = NAMESPACE
+            .captures(&text)
+            .map(|c| format!("{}\\", &c[1]))
+            .unwrap_or_default();
+        classes.insert(
+            format!("{namespace}{}", &cap[2]),
+            ClassInfo {
+                short: cap[2].to_string(),
+                parent: cap.get(3).map(|m| m.as_str().to_string()),
+                abstract_class: cap[1].contains("abstract"),
+                own_factory: text.contains("function newFactory"),
+                file: file.clone(),
+                table: TABLE
+                    .captures(&text)
+                    .map(|c| c[1].rsplit('.').next().unwrap().to_string()),
+                has_factory: text.contains("HasFactory") || text.contains("function newFactory"),
+                uses: USE
+                    .captures_iter(&text)
+                    .map(|c| (c[2].to_string(), c[1].to_string()))
+                    .collect(),
+            },
+        );
+    }
+    let mut factory_files = vec![];
+    php_files(&repo.join("database").join("factories"), &mut factory_files);
+    let factories: HashSet<String> = factory_files
+        .iter()
+        .filter_map(|f| {
+            f.file_stem()?
+                .to_str()?
+                .strip_suffix("Factory")
+                .map(String::from)
+        })
+        .collect();
+    (classes, factories)
+}
+
+fn table_of(info: &ClassInfo) -> String {
+    info.table
+        .clone()
+        .unwrap_or_else(|| plurals(&snake(&info.short))[0].clone())
+}
+
+/// The models that use HasFactory (or inherit it) and have no factory class.
+pub fn without_factory(repo: &Path) -> Vec<NoFactory> {
+    let (_, factories) = scan(repo);
+    all_models(repo)
+        .into_iter()
+        .filter(|m| !factories.contains(m.class.rsplit('\\').next().unwrap_or(&m.class)))
+        .collect()
+}
+
+/// Table -> model class, for the models that have a factory.
+pub fn models_with_factory(repo: &Path) -> HashMap<String, String> {
+    Models::read(repo).by_table
+}
+
+/// Every model that uses HasFactory (or inherits it) and does not make its own (newFactory).
+pub fn all_models(repo: &Path) -> Vec<NoFactory> {
+    let (classes, _) = scan(repo);
+    let mut out: Vec<NoFactory> = classes
+        .iter()
+        .filter(|(full, info)| {
+            !info.abstract_class && !info.own_factory && factory_trait(&classes, full, 0)
+        })
+        .map(|(full, info)| NoFactory {
+            class: full.clone(),
+            table: table_of(info),
+            file: info.file.clone(),
+            uses: info.uses.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.class.cmp(&b.class));
+    out
+}
+
 impl Models {
     pub fn read(repo: &Path) -> Self {
-        static CLASS: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?m)^\s*(?:abstract\s+|final\s+)*class\s+(\w+)(?:\s+extends\s+([\w\\]+))?")
-                .unwrap()
-        });
-        static NAMESPACE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").unwrap());
-        static TABLE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"\$table\s*=\s*['"]([\w.]+)['"]"#).unwrap());
-        static USE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?m)^\s*use\s+([\w\\]+?\\(\w+))\s*;").unwrap());
-
-        let mut files = vec![];
-        php_files(&repo.join("app"), &mut files);
-        let mut classes: HashMap<String, ClassInfo> = HashMap::new();
-        for file in files {
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let Some(cap) = CLASS.captures(&text) else {
-                continue;
-            };
-            let namespace = NAMESPACE
-                .captures(&text)
-                .map(|c| format!("{}\\", &c[1]))
-                .unwrap_or_default();
-            classes.insert(
-                format!("{namespace}{}", &cap[1]),
-                ClassInfo {
-                    short: cap[1].to_string(),
-                    parent: cap.get(2).map(|m| m.as_str().to_string()),
-                    table: TABLE
-                        .captures(&text)
-                        .map(|c| c[1].rsplit('.').next().unwrap().to_string()),
-                    has_factory: text.contains("HasFactory")
-                        || text.contains("function newFactory"),
-                    uses: USE
-                        .captures_iter(&text)
-                        .map(|c| (c[2].to_string(), c[1].to_string()))
-                        .collect(),
-                },
-            );
-        }
-        let mut factory_files = vec![];
-        php_files(&repo.join("database").join("factories"), &mut factory_files);
-        let factories: HashSet<String> = factory_files
-            .iter()
-            .filter_map(|f| {
-                f.file_stem()?
-                    .to_str()?
-                    .strip_suffix("Factory")
-                    .map(String::from)
-            })
-            .collect();
-
+        let (classes, factories) = scan(repo);
         let mut by_table: HashMap<String, String> = HashMap::new();
         let mut names: Vec<&String> = classes.keys().collect();
         names.sort();
@@ -123,10 +181,7 @@ impl Models {
             if !factories.contains(&info.short) || !factory_trait(&classes, full, 0) {
                 continue;
             }
-            let table = info
-                .table
-                .clone()
-                .unwrap_or_else(|| plurals(&snake(&info.short))[0].clone());
+            let table = table_of(info);
             // prefer App\Models\X over an older App\X for the same table
             if !by_table.contains_key(&table) || full.starts_with("App\\Models\\") {
                 by_table.insert(table, full.clone());
@@ -453,8 +508,14 @@ fn build_route(
         function.push(format!(
             "#[\\PHPUnit\\Framework\\Attributes\\DataProvider('{provider}')]"
         ));
+        function.push(format!(
+            "#[\\PHPUnit\\Framework\\Attributes\\Group('{GROUP}')]"
+        ));
     } else {
-        function.push(format!("/** @dataProvider {provider} */"));
+        function.push("/**".into());
+        function.push(format!(" * @dataProvider {provider}"));
+        function.push(format!(" * @group {GROUP}"));
+        function.push(" */".into());
     }
     function.push(format!(
         "public function {name}(bool $signIn, bool $missing, array $body, array $without, int $status, array $structure, array $errors): void"
@@ -535,63 +596,34 @@ fn controller_class(action: Option<&str>) -> String {
     }
 }
 
-fn render_file(
-    config: &Config,
-    place: &Place,
-    methods: &[(String, String, String)],
-    attribute: bool,
-) -> String {
-    let tests = &config.tests;
-    let namespace = &place.namespace;
-    let base = tests
-        .base_class
-        .as_deref()
-        .unwrap_or("Tests\\TestCase")
-        .trim_start_matches('\\');
+/// The class docblock of a test file the tool makes (MARKER: the tool's to rewrite).
+fn feature_doc(config: &Config) -> Vec<String> {
     let old_name = config
         .old
         .repo
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut out = vec![
-        "<?php".to_string(),
-        String::new(),
-        format!("namespace {namespace};"),
-        String::new(),
-        "/**".into(),
+    vec![
+        "/**".to_string(),
         format!(" * {MARKER}: made from the old app's answers ({old_name}). One test per route; its data provider"),
         " * holds the ways the route was sent (happy, not signed in, missing record, empty or incomplete body) and the".into(),
         " * status, JSON keys or validation errors the old app gave. Regenerating replaces this file; once you edit it,".into(),
-        " * remove this marker so the tool leaves it alone.".into(),
-    ];
-    if attribute {
-        out.push(" */".into());
-        out.push(format!(
-            "#[\\PHPUnit\\Framework\\Attributes\\Group('{GROUP}')]"
-        ));
-    } else {
-        out.push(" *".into());
-        out.push(format!(" * @group {GROUP}"));
-        out.push(" */".into());
-    }
-    out.push(format!("class {} extends \\{base}", place.class));
-    out.push("{".into());
-    for (i, (_, key, body)) in methods.iter().enumerate() {
-        if i > 0 {
-            out.push(String::new());
-        }
-        out.push(format!("    /** {key} */"));
-        out.extend(body.lines().map(|l| {
-            if l.is_empty() {
-                String::new()
-            } else {
-                format!("    {l}")
-            }
-        }));
-    }
-    out.push("}".into());
-    out.join("\n") + "\n"
+        " * remove this marker so the tool leaves it alone (it then adds its tests in a block at the end).".into(),
+        " */".into(),
+    ]
+}
+
+/// Method names a generated test must not take in this file: its own methods, and test_x when it has cases_x (the
+/// test's data provider would get that name).
+pub fn taken_names(existing: Option<&str>) -> HashSet<String> {
+    let mut taken = existing.map(testfile::declared).unwrap_or_default();
+    let providers: Vec<String> = taken
+        .iter()
+        .filter_map(|n| n.strip_prefix("cases_").map(|r| format!("test_{r}")))
+        .collect();
+    taken.extend(providers);
+    taken
 }
 
 /// PHPUnit 10+ reads data providers from attributes; 9 from @dataProvider.
@@ -601,6 +633,11 @@ pub fn phpunit_attributes(repo: &Path) -> bool {
 
 /// The PHPUnit major version in the repo's composer.lock.
 pub fn phpunit_major(repo: &Path) -> Option<u32> {
+    package_major(repo, "phpunit/phpunit")
+}
+
+/// The major version of a package in the repo's composer.lock.
+pub fn package_major(repo: &Path, package: &str) -> Option<u32> {
     let lock: Value = std::fs::read_to_string(repo.join("composer.lock"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -608,7 +645,7 @@ pub fn phpunit_major(repo: &Path) -> Option<u32> {
     let version = ["packages-dev", "packages"]
         .iter()
         .flat_map(|k| lock[*k].as_array().cloned().unwrap_or_default())
-        .find(|p| p["name"] == "phpunit/phpunit")
+        .find(|p| p["name"] == package)
         .and_then(|p| p["version"].as_str().map(String::from))
         .unwrap_or_default();
     version
@@ -671,22 +708,29 @@ pub fn generate(
             place.class = format!("{}{n}", base.class);
             place.file = base.file.with_file_name(format!("{}.php", place.class));
         }
-        let class = place.fqcn();
         let file = place.file.clone();
-        let file_name = format!("{}.php", place.class);
-        if file.exists()
-            && !std::fs::read_to_string(&file)
-                .unwrap_or_default()
-                .contains(MARKER)
-        {
-            generated.cannot.extend(
-                entries
-                    .into_iter()
-                    .map(|(k, _)| (k, format!("{file_name} was edited by hand (no marker)"))),
-            );
-            continue;
-        }
-        let mut taken = HashSet::new();
+        let existing = std::fs::read_to_string(&file).ok();
+        // a test file the app already has: the generated tests go in a block at the end of its class
+        let class = match existing.as_deref() {
+            Some(text) if !testfile::owned(text) => {
+                if let Err(why) = testfile::usable(text) {
+                    let name = file
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    generated.cannot.extend(
+                        entries
+                            .into_iter()
+                            .map(|(k, _)| (k, format!("{name} {why}"))),
+                    );
+                    continue;
+                }
+                testfile::class_of(text).unwrap_or_else(|| place.fqcn())
+            }
+            _ => place.fqcn(),
+        };
+        let mut taken = taken_names(existing.as_deref());
         let mut methods = vec![];
         for (key, cases) in entries {
             let name = method_name(&key, &mut taken);
@@ -704,19 +748,32 @@ pub fn generate(
                         method: format!("{name}#{case}"),
                         key: key.clone(),
                     }));
-                    methods.push((name, key, code));
+                    methods.push(format!("/** {key} */\n{code}"));
                 }
                 Err(why) => generated.cannot.push((key, why)),
             }
         }
         if methods.is_empty() {
-            let _ = std::fs::remove_file(&file);
+            testfile::clear(&file);
             continue;
         }
         if let Some(parent) = file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&file, render_file(config, &place, &methods, attribute));
+        let base = config
+            .tests
+            .base_class
+            .as_deref()
+            .unwrap_or("Tests\\TestCase")
+            .trim_start_matches('\\');
+        let text = testfile::render(
+            existing.as_deref(),
+            &place,
+            &feature_doc(config),
+            base,
+            &methods,
+        );
+        let _ = std::fs::write(&file, text);
         generated.files.push(file);
     }
     generated
@@ -758,7 +815,8 @@ pub fn run_phpunit(
                     .unwrap_or(file)
                     .to_string_lossy()
                     .replace('\\', "/");
-                phpunit(config, &[&rel], &mut results, cover_part)
+                // only the generated tests: the file may be one the app's own tests are in too
+                phpunit(config, &["--group", GROUP, &rel], &mut results, cover_part)
             })
         } else {
             let filter = format!(
@@ -801,24 +859,7 @@ pub fn run_phpunit(
 
 /// The class a generated test file declares, with its namespace.
 fn file_class(file: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
-    let mut namespace = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("namespace ") {
-            namespace = Some(rest.trim_end_matches(';').trim().to_string());
-        } else if let Some(rest) = line
-            .strip_prefix("final class ")
-            .or_else(|| line.strip_prefix("class "))
-        {
-            let class = rest.split_whitespace().next()?;
-            return Some(match namespace {
-                Some(n) => format!("{n}\\{class}"),
-                None => class.to_string(),
-            });
-        }
-    }
-    None
+    testfile::class_of(&std::fs::read_to_string(file).ok()?)
 }
 
 /// One PHPUnit run (`target`: a file, or --group ...), its results added to `results`; with `cover`, coverage goes
@@ -906,15 +947,15 @@ mod tests {
     #[test]
     fn class_of_a_test_file() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("UnitParityTest.php");
+        let file = dir.path().join("UnitTest.php");
         std::fs::write(
             &file,
-            "<?php\n\nnamespace Tests\\Unit\\Models;\n\nuse Tests\\TestCase;\n\nclass UnitParityTest extends TestCase\n{\n}\n",
+            "<?php\n\nnamespace Tests\\Unit\\Models;\n\nuse Tests\\TestCase;\n\nclass UnitTest extends TestCase\n{\n}\n",
         )
         .unwrap();
         assert_eq!(
             file_class(&file).as_deref(),
-            Some("Tests\\Unit\\Models\\UnitParityTest")
+            Some("Tests\\Unit\\Models\\UnitTest")
         );
         std::fs::write(&file, "<?php\nfinal class Bare extends X {}\n").unwrap();
         assert_eq!(file_class(&file).as_deref(), Some("Bare"));
@@ -1088,12 +1129,16 @@ mod tests {
         specs.push(spec("c1", "GET api/ping", "happy", None));
         specs.push(spec("x1", "GET api/tested", "happy", Some("App\\X@y")));
         specs.push(spec("h1", "GET api/hand", "happy", Some("App\\Hand@y")));
+        specs.push(spec("b1", "GET api/base", "happy", Some("App\\Base@y")));
+        // a test file someone wrote, with a method the generated test would be named after
+        let hand = "<?php\n\nnamespace Tests\\Feature\\Parity;\n\nclass HandTest extends \\Tests\\TestCase\n{\n    public function test_get_api_hand(): void\n    {\n    }\n}\n";
         put(
-            &config
-                .new
-                .repo
-                .join("tests/Feature/Parity/HandParityTest.php"),
-            "<?php // mine\n",
+            &config.new.repo.join("tests/Feature/Parity/HandTest.php"),
+            hand,
+        );
+        put(
+            &config.new.repo.join("tests/Feature/Parity/BaseTest.php"),
+            "<?php\nabstract class BaseTest extends TestCase\n{\n}\n",
         );
 
         let old_rows: HashMap<String, Value> = [
@@ -1115,6 +1160,7 @@ mod tests {
             ("t1", json!({"status": 200, "kind": "json", "json": {}})),
             ("c1", json!({"status": 500, "kind": "json", "json": {}})),
             ("h1", json!({"status": 200, "kind": "json", "json": {}})),
+            ("b1", json!({"status": 200, "kind": "json", "json": {}})),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -1132,7 +1178,7 @@ mod tests {
             },
         )]);
         let skip = HashSet::from([(
-            "Tests\\Feature\\Parity\\ShopControllerParityTest".to_string(),
+            "Tests\\Feature\\Parity\\ShopControllerTest".to_string(),
             "test_get_api_shops_shop#missing".to_string(),
         )]);
 
@@ -1140,17 +1186,23 @@ mod tests {
         let dir_tests = config.new.repo.join("tests/Feature/Parity");
         assert_eq!(
             out.files,
-            vec![dir_tests.join("ShopControllerParityTest.php")]
+            vec![
+                dir_tests.join("HandTest.php"),
+                dir_tests.join("ShopControllerTest.php")
+            ]
         );
-        assert!(!dir_tests.join("ClosureParityTest.php").exists());
-        assert_eq!(
-            std::fs::read_to_string(dir_tests.join("HandParityTest.php")).unwrap(),
-            "<?php // mine\n"
-        );
+        assert!(!dir_tests.join("ClosureTest.php").exists());
+        // the hand-written file keeps what it had and gets the generated test in a block, under a free name
+        let merged = std::fs::read_to_string(dir_tests.join("HandTest.php")).unwrap();
+        assert_eq!(testfile::strip(&merged), hand);
+        assert!(merged.contains("    public function test_get_api_hand_2(bool $signIn"));
+        assert!(merged.contains("    public static function cases_get_api_hand_2(): array"));
         let made: Vec<&str> = out.made.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(out.made[0].class, "Tests\\Feature\\Parity\\HandTest");
         assert_eq!(
             made,
             vec![
+                "test_get_api_hand_2#happy",
                 "test_get_api_shops_shop#happy",
                 "test_get_api_shops_shop#guest",
                 "test_put_api_orders_order_note#happy",
@@ -1167,20 +1219,18 @@ mod tests {
             cannot["GET api/things/{thing}"],
             "no factory for {thing} (value typed by hand)"
         );
-        assert_eq!(
-            cannot["GET api/hand"],
-            "HandParityTest.php was edited by hand (no marker)"
-        );
+        assert_eq!(cannot["GET api/base"], "BaseTest.php is an abstract class");
+        assert!(!cannot.contains_key("GET api/hand"));
         assert!(!cannot.contains_key("GET api/tested"));
 
-        let php = std::fs::read_to_string(&out.files[0]).unwrap();
+        let php = std::fs::read_to_string(&out.files[1]).unwrap();
         for line in [
             "namespace Tests\\Feature\\Parity;",
             MARKER,
-            " * @group laravel-parity",
-            "class ShopControllerParityTest extends \\Tests\\TestCase",
+            "class ShopControllerTest extends \\Tests\\TestCase",
+            "    // <laravel-parity> generated",
             "    /** GET api/shops/{shop} */",
-            "    /** @dataProvider cases_get_api_shops_shop */",
+            "    /**\n     * @dataProvider cases_get_api_shops_shop\n     * @group laravel-parity\n     */",
             "    public function test_get_api_shops_shop(bool $signIn, bool $missing, array $body, array $without, int $status, array $structure, array $errors): void",
             "        $shop = \\App\\Models\\Shop::factory()->create([]);",
             "        $shopKey = $missing ? 999999999 : $shop->getKey();",
@@ -1246,15 +1296,13 @@ mod tests {
                 "no [tests.acting_as] api in the pair file".to_string()
             )]
         );
-        let php = std::fs::read_to_string(config.new.repo.join("tests/Shop/ClosureParityTest.php"))
-            .unwrap();
+        let php =
+            std::fs::read_to_string(config.new.repo.join("tests/Shop/ClosureTest.php")).unwrap();
         assert!(php.contains("namespace Tests\\Shop;"));
+        assert!(php.contains(" */\nclass ClosureTest extends \\Tests\\ShopCase"));
         assert!(php.contains(
-            " */\n#[\\PHPUnit\\Framework\\Attributes\\Group('laravel-parity')]\nclass ClosureParityTest extends \\Tests\\ShopCase"
+            "    #[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_get_api_ping')]\n    #[\\PHPUnit\\Framework\\Attributes\\Group('laravel-parity')]\n    public function test_get_api_ping("
         ));
-        assert!(
-            php.contains("#[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_get_api_ping')]")
-        );
         assert!(php.contains("$fill = ['{user}' => $user?->getKey()];"));
         assert!(!php.contains("$this->withHeaders"));
         assert!(!php.contains("if ($signIn)"));

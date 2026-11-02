@@ -16,7 +16,7 @@ use crate::config::{Config, Side};
 use crate::plan::{self, Spec};
 use crate::report::{self, Skipped};
 use crate::routes::{self, Route, RouteDiff};
-use crate::{codemap, db, runner, say, testgen};
+use crate::{codemap, db, runner, say, testfile, testgen};
 
 pub type Res<T> = Result<T, String>;
 
@@ -552,6 +552,12 @@ fn auto_reports(config: &Config, meta: &Value, run: &[Spec]) {
 }
 
 pub fn report(config: &Config) -> Res<String> {
+    report_with(config, true)
+}
+
+/// Write report.md and the fix list. `speak`: say the result line and record the run in the history (a report made
+/// for another step, such as `tests`, does neither: its comparison results are the last run's).
+pub fn report_with(config: &Config, speak: bool) -> Res<String> {
     let specs: Vec<Spec> = read(&config.work.join("requests.json")).unwrap_or_default();
     let (run, skipped) = runnable(&specs, None);
     let meta: Value = read(&config.work.join("run.json")).unwrap_or(json!({}));
@@ -617,7 +623,9 @@ pub fn report(config: &Config) -> Res<String> {
             count("broken")
         )
     });
-    crate::history::record(config, &results, &fixes);
+    if speak {
+        crate::history::record(config, &results, &fixes);
+    }
     let line = format!(
         "Result: {}. Report: {}. Fix list: {} items in {}.{}",
         counts_line(&results),
@@ -626,7 +634,9 @@ pub fn report(config: &Config) -> Res<String> {
         config.work.join("fixes.md").display(),
         since.unwrap_or_default()
     );
-    say(&line);
+    if speak {
+        say(&line);
+    }
     Ok(line)
 }
 
@@ -670,9 +680,9 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
     }
     say("Asking codemap which shared routes have no test in the new repo ...");
     let mut codemap = codemap::Codemap::start(&config.new.repo)?;
-    // a route counts as tested only by a test someone wrote: the tool's own generated files do not count, or a
-    // second run would see its first run's tests and generate nothing
-    let mut generated_files: HashMap<String, bool> = HashMap::new();
+    // a route counts as tested only by a test someone wrote: the tool's own files and its blocks in the app's own test
+    // files do not count, or a second run would see its first run's tests and generate nothing
+    let mut texts: HashMap<String, Option<(String, bool)>> = HashMap::new();
     let mut untested = BTreeSet::new();
     // one question per route, not per case (a route is sent several ways but tested in one place)
     let mut asked = BTreeSet::new();
@@ -681,11 +691,31 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
             continue;
         }
         let files = codemap.route_test_files(&spec.method, &spec.template)?;
+        // the route's path up to its first parameter, as a test written by hand would have it
+        let path = spec
+            .template
+            .split('{')
+            .next()
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_string();
         let written = files.iter().any(|f| {
-            !*generated_files.entry(f.clone()).or_insert_with(|| {
-                std::fs::read_to_string(config.new.repo.join(f))
-                    .is_ok_and(|t| t.contains(testgen::MARKER))
-            })
+            let entry = texts.entry(f.clone()).or_insert_with(|| {
+                let text = std::fs::read_to_string(config.new.repo.join(f)).ok()?;
+                if testfile::owned(&text) {
+                    return None;
+                }
+                let own = testfile::strip(&text);
+                let had_blocks = own.len() != text.len();
+                Some((own, had_blocks))
+            });
+            match entry {
+                None => false,
+                // codemap may have found the route in the generated block: it counts only when the file's own
+                // part names it
+                Some((own, true)) => !path.is_empty() && own.contains(&path),
+                Some((_, false)) => true,
+            }
         });
         if !written {
             untested.insert(spec.key.clone());
@@ -694,10 +724,22 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
     drop(codemap);
     let routes: BTreeSet<&str> = specs.iter().map(|s| s.key.as_str()).collect();
     say(&format!(
-        "{} of {} shared routes have no test.",
+        "{} of {} shared routes have no test someone wrote.",
         untested.len(),
         routes.len()
     ));
+    // factories for the models that have none, so the tests can make the rows they need (checked on the new app)
+    let mut factories_line = None;
+    if verify && config.tests.factories() {
+        runner::ensure_ready(&config.new)?;
+        if let Err(e) = crate::factories::write_missing(config) {
+            say(&format!("Factories: not written: {e}"));
+        }
+        factories_line = crate::factories::last(config).and_then(|f| crate::factories::line(&f));
+        if let Some(line) = &factories_line {
+            say(line);
+        }
+    }
     let tables = db::tables(config, &config.new)?;
     let mut generated = testgen::generate(
         config,
@@ -707,9 +749,13 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         &tables,
         &HashSet::new(),
     );
+    let route_keys = |list: &[testgen::Made]| -> BTreeSet<String> {
+        list.iter().map(|m| m.key.clone()).collect()
+    };
     say(&format!(
-        "Generated {} tests in {} files; {} routes could not get one.",
+        "Feature tests: {} test cases for {} routes, in {} files; {} routes could not get one.",
         generated.made.len(),
+        route_keys(&generated.made).len(),
         generated.files.len(),
         generated.cannot.len()
     ));
@@ -722,7 +768,8 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
     }
     let mut unit = crate::units::generate(config, &HashSet::new());
     say(&format!(
-        "Generated {} unit tests in {} files; {} methods could not get one.",
+        "Unit tests: {} tests for {} methods, in {} files; {} methods could not get one.",
+        unit.made.len(),
         unit.made.len(),
         unit.files.len(),
         unit.cannot.len()
@@ -730,7 +777,10 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
 
     let mut outcome = HashMap::new();
     let mut coverage = Value::Null;
-    if verify && !generated.files.is_empty() {
+    // what ran, counted before --drop-failing takes the failing tests out
+    let mut counted: Option<(Counts, Counts)> = None;
+    let mut removed = 0;
+    if verify && !(generated.files.is_empty() && unit.files.is_empty()) {
         runner::ensure_ready(&config.new)?;
         // coverage: the app's own tests (measured once, reused until they or the code change), then the generated
         // ones while they run anyway
@@ -798,22 +848,27 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
                 say(&format!("Coverage: {note}"));
             }
         }
+        let (feature, units) = (
+            Counts::of(&generated.made, &outcome),
+            Counts::of(&unit.made, &outcome),
+        );
+        say(&format!(
+            "Feature test cases: {}. Unit tests: {}.",
+            feature.text(),
+            units.text()
+        ));
         let failing: HashSet<(String, String)> = outcome
             .iter()
             .filter(|(_, v)| v.is_some())
             .map(|(k, _)| k.clone())
             .collect();
-        say(&format!(
-            "{} pass, {} fail.",
-            outcome.len() - failing.len(),
-            failing.len()
-        ));
+        counted = Some((feature, units));
         if drop_failing && !failing.is_empty() {
             generated = testgen::generate(config, &specs, &old_rows, &untested, &tables, &failing);
             unit = crate::units::generate(config, &failing);
+            removed = failing.len();
             say(&format!(
-                "Removed the {} failing tests from the files; they are listed in tests.md.",
-                failing.len()
+                "Removed the {removed} failing tests from the files; they are listed in tests.md."
             ));
         }
     }
@@ -822,7 +877,7 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         + crate::layout::remove_stale(config, crate::layout::Kind::Unit, &unit.files);
     if stale > 0 {
         say(&format!(
-            "Removed {stale} generated test files that were not written again (moved, or their route has a test now)."
+            "Took the generated tests out of {stale} files this run did not write again (moved, or their route has a test now)."
         ));
     }
     let key_of: HashMap<(String, String), String> = generated
@@ -836,11 +891,29 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         .filter_map(|(k, v)| v.as_ref().map(|m| (k, m)))
         .collect();
     failed.sort();
-    let mut lines = vec!["# Generated tests".to_string(), String::new()];
-    // route coverage: routes some test reaches, before and after the generated ones
+
+    // routes: a route counts as tested after this run only when one of its generated cases passed
     let tested_before = routes.len() - untested.len();
-    let given: BTreeSet<&str> = generated.made.iter().map(|m| m.key.as_str()).collect();
-    let tested_after = tested_before + given.len();
+    let mut passing_routes = BTreeSet::new();
+    let mut ran_routes = BTreeSet::new();
+    for m in &generated.made {
+        match outcome.get(&(m.class.clone(), m.method.clone())) {
+            Some(None) => {
+                passing_routes.insert(m.key.clone());
+                ran_routes.insert(m.key.clone());
+            }
+            Some(Some(_)) => {
+                ran_routes.insert(m.key.clone());
+            }
+            None => {}
+        }
+    }
+    let with_tests = route_keys(&generated.made);
+    let cannot_routes: BTreeSet<&str> = generated.cannot.iter().map(|(k, _)| k.as_str()).collect();
+    let all_failing = ran_routes.difference(&passing_routes).count();
+    let not_run = with_tests.difference(&ran_routes).count();
+    let ran = !outcome.is_empty();
+    let tested_after = tested_before + passing_routes.len();
     let share = |n: usize| {
         if routes.is_empty() {
             0.0
@@ -848,12 +921,63 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
             (n as f64 * 1000.0 / routes.len() as f64).round() / 10.0
         }
     };
-    lines.push(format!(
-        "Routes with a test: {tested_before} of {} ({}%) before, {tested_after} ({}%) with the generated tests.",
-        routes.len(),
-        share(tested_before),
-        share(tested_after)
-    ));
+    let routes_line = if ran {
+        format!(
+            "Routes: {} shared; {tested_before} ({}%) had a test someone wrote; {} got generated tests: {} with a passing case, {all_failing} with every case failing{}; {} could not get one. Routes with a test someone wrote or a passing generated one: {tested_after} ({}%).",
+            routes.len(),
+            share(tested_before),
+            with_tests.len(),
+            passing_routes.len(),
+            if not_run > 0 {
+                format!(", {not_run} that did not run")
+            } else {
+                String::new()
+            },
+            cannot_routes.len(),
+            share(tested_after)
+        )
+    } else {
+        format!(
+            "Routes: {} shared; {tested_before} ({}%) had a test someone wrote; {} got generated tests (not run); {} could not get one.",
+            routes.len(),
+            share(tested_before),
+            with_tests.len(),
+            cannot_routes.len()
+        )
+    };
+    let methods_line = match &counted {
+        Some((_, units)) => format!(
+            "Methods of app/ classes: {} got a unit test ({}); {} could not get one.",
+            units.made,
+            units.text(),
+            unit.cannot.len()
+        ),
+        None => format!(
+            "Methods of app/ classes: {} got a unit test (not run); {} could not get one.",
+            unit.made.len(),
+            unit.cannot.len()
+        ),
+    };
+
+    let mut lines = vec!["# Generated tests".to_string(), String::new()];
+    lines.push(routes_line.clone());
+    lines.push(String::new());
+    lines.push(methods_line.clone());
+    if let Some((feature, _)) = &counted {
+        lines.push(String::new());
+        lines.push(format!(
+            "Feature test cases (one per way a route was sent): {}.",
+            feature.text()
+        ));
+    }
+    if removed > 0 {
+        lines.push(String::new());
+        lines.push(format!("{removed} failing tests were taken out of the files (--drop-failing); they are listed below."));
+    }
+    if let Some(line) = &factories_line {
+        lines.push(String::new());
+        lines.push(line.clone());
+    }
     if let Some(line) = crate::coverage::line(&coverage) {
         lines.push(String::new());
         lines.push(line);
@@ -898,50 +1022,144 @@ pub fn tests(config: &Config, verify: bool, drop_failing: bool) -> Res<String> {
         }
         lines.push(String::new());
     }
+    if let Some(found) = crate::factories::last(config) {
+        for (key, title) in [
+            (
+                "failed",
+                "## Factories the tool could not make work (not kept)",
+            ),
+            (
+                "broken",
+                "## The app's own factories that cannot make a row",
+            ),
+        ] {
+            let list = found[key].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                continue;
+            }
+            lines.push(title.into());
+            lines.push(String::new());
+            for f in &list {
+                lines.push(format!(
+                    "- {}: {}",
+                    f["model"].as_str().unwrap_or_default(),
+                    f["error"].as_str().unwrap_or_default()
+                ));
+            }
+            lines.push(String::new());
+        }
+    }
     let mut cannot = generated.cannot.clone();
     cannot.extend(unit.cannot.iter().cloned());
     cannot.sort();
-    if !cannot.is_empty() {
-        lines.push("## Could not be generated (test these by hand)".into());
+    if !generated.cannot.is_empty() {
+        lines.push(format!(
+            "## Routes that could not get a test ({})",
+            generated.cannot.len()
+        ));
         lines.push(String::new());
-        lines.extend(cannot.iter().map(|(k, why)| format!("- {k}: {why}")));
+        let mut list = generated.cannot.clone();
+        list.sort();
+        lines.extend(list.iter().map(|(k, why)| format!("- {k}: {why}")));
+        lines.push(String::new());
+    }
+    if !unit.cannot.is_empty() {
+        lines.push(format!(
+            "## Methods that could not get a test ({})",
+            unit.cannot.len()
+        ));
+        lines.push(String::new());
+        let mut list = unit.cannot.clone();
+        list.sort();
+        lines.extend(list.iter().map(|(k, why)| format!("- {k}: {why}")));
     }
     let _ = std::fs::write(config.work.join("tests.md"), lines.join("\n") + "\n");
-    let ran = !outcome.is_empty();
+    let counts_json = |c: &Option<Counts>| match c {
+        Some(c) => {
+            json!({"made": c.made, "passed": c.passed, "failed": c.failed, "not_run": c.not_run})
+        }
+        None => Value::Null,
+    };
     let summary = json!({
         "untested": untested.len(),
         "generated": generated.made.len() + unit.made.len(),
         "files": generated.files.len() + unit.files.len(),
         "unit": {"generated": unit.made.len(), "files": unit.files.len(), "cannot": unit.cannot.len()},
         "cannot": cannot.len(),
+        "cannot_routes": generated.cannot.len(),
+        "cannot_methods": unit.cannot.len(),
         "dir": config.tests.place_text(),
         "passed": if ran { json!(outcome.len() - failed.len()) } else { json!("?") },
         "failed": if ran { json!(failed.len()) } else { json!("?") },
-        "routes": {"shared": routes.len(), "tested_before": tested_before, "tested_after": tested_after},
+        "removed": removed,
+        "feature_cases": counts_json(&counted.as_ref().map(|c| c.0.clone())),
+        "unit_tests": counts_json(&counted.as_ref().map(|c| c.1.clone())),
+        "routes": {"shared": routes.len(), "tested_before": tested_before, "tested_after": tested_after,
+                   "with_generated": with_tests.len(), "passing": passing_routes.len(),
+                   "all_failing": all_failing, "not_run": not_run, "cannot": cannot_routes.len()},
+        "factories": factories_line,
         "coverage": coverage,
     });
     write(&config.work.join("tests.json"), &summary)?;
     write(
         &config.work.join("tests-detail.json"),
-        &json!({"failing": failing_json, "cannot": cannot.iter().map(|(k, w)| json!({"route": k, "why": w})).collect::<Vec<_>>()}),
+        &json!({"failing": failing_json,
+                "cannot": generated.cannot.iter().map(|(k, w)| json!({"route": k, "why": w}))
+                    .chain(unit.cannot.iter().map(|(k, w)| json!({"method": k, "why": w})))
+                    .collect::<Vec<_>>()}),
     )?;
     say(&format!(
         "Details: {}",
         config.work.join("tests.md").display()
     ));
-    report(config)?;
-    Ok(format!(
-        "{} untested routes; {} tests generated in {}, {} pass, {} fail; {} routes could not get a test{}",
-        untested.len(),
-        generated.made.len(),
-        config.tests.place_text(),
-        summary["passed"],
-        summary["failed"],
-        cannot.len(),
-        crate::coverage::line(&coverage)
-            .map(|l| format!(". {}", l.trim_end_matches('.')))
-            .unwrap_or_default()
-    ))
+    // report.md shows these numbers; its own result line is the last comparison run's, so it is not repeated here
+    report_with(config, false)?;
+    let mut out = vec![routes_line, methods_line];
+    out.extend(factories_line);
+    out.extend(crate::coverage::line(&coverage));
+    Ok(out.join(" "))
+}
+
+/// Generated tests of one kind and how they ran.
+#[derive(Clone)]
+struct Counts {
+    made: usize,
+    passed: usize,
+    failed: usize,
+    not_run: usize,
+}
+
+impl Counts {
+    fn of(made: &[testgen::Made], outcome: &HashMap<(String, String), Option<String>>) -> Self {
+        let mut counts = Counts {
+            made: made.len(),
+            passed: 0,
+            failed: 0,
+            not_run: 0,
+        };
+        for m in made {
+            match outcome.get(&(m.class.clone(), m.method.clone())) {
+                Some(None) => counts.passed += 1,
+                Some(Some(_)) => counts.failed += 1,
+                None => counts.not_run += 1,
+            }
+        }
+        counts
+    }
+
+    fn text(&self) -> String {
+        let mut text = format!(
+            "{} made, {} pass, {} fail",
+            self.made, self.passed, self.failed
+        );
+        if self.not_run > 0 {
+            text.push_str(&format!(
+                ", {} did not run (PHP stopped or the class did not load)",
+                self.not_run
+            ));
+        }
+        text
+    }
 }
 
 pub fn check(config: &Config) -> Res<Value> {

@@ -1,7 +1,7 @@
 //! The app's own classes, method by method: every public method of the models, services, exports, notifications
 //! ... in app/ runs on both apps (newest row for a model, constructor and method arguments made the way a unit test
 //! would), rolled back with everything leaving the app faked. What differs goes in the fix list; what the old app
-//! answered becomes a unit test next to the app's own (tests/Unit/<folder under app>/<Class>ParityTest.php).
+//! answered becomes a unit test next to the app's own (tests/Unit/<folder under app>/<Class>Test.php).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use crate::fixlist::Fix;
 use crate::layout::{self, Kind};
 use crate::ops::{Res, read, write};
 use crate::plan::request_id;
+use crate::testfile;
 use crate::testgen::{self, GROUP, MARKER, php_string, php_value};
 use crate::{runner, say};
 
@@ -90,7 +91,7 @@ fn items(old: &[Value], new: &[Value], only: Option<&str>) -> Vec<Value> {
 
 /// Probe the items on one app, BATCH at a time per process, `workers` processes; a process that stops (a method
 /// that printed straight out, a timeout, a crash) is started again for the rest.
-fn run_side(config: &Config, side: &Side, items: &[Value], clock: &str) -> Vec<Value> {
+pub fn run_side(config: &Config, side: &Side, items: &[Value], clock: &str) -> Vec<Value> {
     let batches: Vec<Vec<Value>> = items.chunks(BATCH).map(|c| c.to_vec()).collect();
     let queue: Mutex<VecDeque<Vec<Value>>> = Mutex::new(batches.into());
     let found: Mutex<Vec<Value>> = Mutex::new(vec![]);
@@ -105,7 +106,13 @@ fn run_side(config: &Config, side: &Side, items: &[Value], clock: &str) -> Vec<V
                 while !batch.is_empty() {
                     let probe: Vec<Value> = batch
                         .iter()
-                        .map(|i| json!({"id": i["id"], "class": i["class"], "method": i["method"]}))
+                        .map(|i| {
+                            let mut item = json!({"id": i["id"], "class": i["class"], "method": i["method"]});
+                            if i.get("code").is_some() {
+                                item["code"] = i["code"].clone();
+                            }
+                            item
+                        })
                         .collect();
                     let job = json!({"mode": "probe", "clock": clock, "timeout": TIMEOUT, "users": config.users,
                                      "items": probe});
@@ -480,7 +487,7 @@ fn argument(how: &Value) -> String {
     let class = |h: &Value| format!("\\{}", h["class"].as_str().unwrap_or_default());
     match how["how"].as_str().unwrap_or_default() {
         "given" | "default" => php_value(&how["value"]),
-        "model" => format!("$this->parityRow({}::class)", class(how)),
+        "model" => format!("$this->generatedRow({}::class)", class(how)),
         "request" => format!("{}::create('/', 'GET')", class(how)),
         "now" => "\\Illuminate\\Support\\Carbon::now()".into(),
         "make" => format!("app({}::class)", class(how)),
@@ -526,7 +533,7 @@ fn expect(old: &Value, var: &str) -> Vec<String> {
         return lines;
     }
     lines.push(format!(
-        "        $this->assertParityType({}, {var});",
+        "        $this->assertGeneratedType({}, {var});",
         php_string(kind)
     ));
     if let Some(related) = old["related"].as_str() {
@@ -608,7 +615,7 @@ fn test_body(row: &Value) -> Option<Vec<String>> {
     }
     if let Some(attribute) = old["attribute"].as_str() {
         lines.push(format!(
-            "        $value = $this->parityRow({class}::class)->getAttribute({});",
+            "        $value = $this->generatedRow({class}::class)->getAttribute({});",
             php_string(attribute)
         ));
         lines.extend(expect(old, "$value"));
@@ -620,7 +627,7 @@ fn test_body(row: &Value) -> Option<Vec<String>> {
             format!("(new {class}())")
         } else {
             lines.push(format!(
-                "        $subject = $this->parityRow({class}::class);"
+                "        $subject = $this->generatedRow({class}::class);"
             ));
             "$subject".into()
         }
@@ -643,94 +650,88 @@ fn test_body(row: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
-fn render(
-    config: &Config,
-    place: &layout::Place,
-    class: &str,
-    tests: &[(String, Vec<String>)],
-) -> String {
+/// The methods of a class's generated unit tests: the tests, then the helpers they call.
+fn members(config: &Config, tests: &[(String, Vec<String>)]) -> Vec<String> {
     let attribute = testgen::phpunit_attributes(&config.new.repo);
     let void = testgen::phpunit_major(&config.new.repo).is_none_or(|m| m >= 8);
     let ret = if void { ": void" } else { "" };
-    let base = config
-        .tests
-        .unit_base_class
-        .as_deref()
-        .unwrap_or("Tests\\TestCase")
-        .trim_start_matches('\\');
-    let mut out = vec![
-        "<?php".to_string(),
-        String::new(),
-        format!("namespace {};", place.namespace),
-        String::new(),
-        "/**".into(),
+    let mut out = vec![];
+    for (name, body) in tests {
+        let mut lines = vec![];
+        if attribute {
+            lines.push(format!(
+                "#[\\PHPUnit\\Framework\\Attributes\\Group('{GROUP}')]"
+            ));
+        } else {
+            lines.push(format!("/** @group {GROUP} */"));
+        }
+        lines.push(format!("public function {name}(){ret}"));
+        lines.push("{".into());
+        lines.push("    $this->fakeOutsideWorld();".into());
+        // the bodies are written for a class body (8 spaces); the block indents them again
+        lines.extend(
+            body.iter()
+                .map(|l| l.strip_prefix("    ").unwrap_or(l).to_string()),
+        );
+        lines.push("}".into());
+        out.push(lines.join("\n"));
+    }
+    out.push(format!(
+        "/** Mail, notifications, queued jobs and HTTP calls are faked: a generated test sends nothing. */
+private function fakeOutsideWorld(){ret}
+{{
+    \\Illuminate\\Support\\Facades\\Mail::fake();
+    \\Illuminate\\Support\\Facades\\Notification::fake();
+    \\Illuminate\\Support\\Facades\\Queue::fake();
+    if (class_exists(\\Illuminate\\Support\\Facades\\Http::class)) {{
+        \\Illuminate\\Support\\Facades\\Http::fake();
+    }}
+}}"
+    ));
+    out.push(
+        "/** A row of the model: one already in the test database, else one from its factory, else a new one. */
+private function generatedRow(string $class)
+{
+    $row = $class::query()->first();
+    if ($row === null && method_exists($class, 'factory')) {
+        try {
+            $row = $class::factory()->create();
+        } catch (\\Throwable $e) {
+            // HasFactory without a factory class, or a factory the test data cannot satisfy
+        }
+    }
+
+    return $row ?? new $class();
+}"
+        .to_string(),
+    );
+    out.push(format!(
+        "/** The old app's type; null passes (the test data may lack what the old app's data had). */
+private function assertGeneratedType(string $expected, $value){ret}
+{{
+    if ($value === null) {{
+        $this->addToAssertionCount(1);
+    }} elseif (class_exists($expected) || interface_exists($expected)) {{
+        $this->assertInstanceOf($expected, $value);
+    }} elseif (in_array($expected, ['integer', 'double'], true)) {{
+        $this->assertIsNumeric($value);
+    }} else {{
+        $this->assertSame($expected, gettype($value));
+    }}
+}}"
+    ));
+    out
+}
+
+fn unit_doc(class: &str) -> Vec<String> {
+    vec![
+        "/**".to_string(),
         format!(" * {MARKER}: what {class}'s methods gave back on the old app (type, keys, related class; a model's"),
         " * table, keys, fillable, hidden and casts exactly). Regenerating replaces this file; once you edit it, remove"
             .into(),
-        " * this marker so the tool leaves it alone.".into(),
-    ];
-    if attribute {
-        out.push(" */".into());
-        out.push(format!(
-            "#[\\PHPUnit\\Framework\\Attributes\\Group('{GROUP}')]"
-        ));
-    } else {
-        out.push(" *".into());
-        out.push(format!(" * @group {GROUP}"));
-        out.push(" */".into());
-    }
-    out.push(format!("class {} extends \\{base}", place.class));
-    out.push("{".into());
-    out.push(format!("    protected function setUp(){ret}"));
-    out.push("    {".into());
-    out.push("        parent::setUp();".into());
-    out.push("        \\Illuminate\\Support\\Facades\\Mail::fake();".into());
-    out.push("        \\Illuminate\\Support\\Facades\\Notification::fake();".into());
-    out.push("        \\Illuminate\\Support\\Facades\\Queue::fake();".into());
-    out.push("        if (class_exists(\\Illuminate\\Support\\Facades\\Http::class)) {".into());
-    out.push("            \\Illuminate\\Support\\Facades\\Http::fake();".into());
-    out.push("        }".into());
-    out.push("    }".into());
-    for (name, body) in tests {
-        out.push(String::new());
-        out.push(format!("    public function {name}(){ret}"));
-        out.push("    {".into());
-        out.extend(body.iter().cloned());
-        out.push("    }".into());
-    }
-    out.push(String::new());
-    out.push("    /** A row of the model: one already in the test database, else one from its factory, else a new one. */".into());
-    out.push("    private function parityRow(string $class)".into());
-    out.push("    {".into());
-    out.push("        $row = $class::query()->first();".into());
-    out.push("        if ($row === null && method_exists($class, 'factory')) {".into());
-    out.push("            try {".into());
-    out.push("                $row = $class::factory()->create();".into());
-    out.push("            } catch (\\Throwable $e) {".into());
-    out.push("                // HasFactory without a factory class, or a factory the test data cannot satisfy".into());
-    out.push("            }".into());
-    out.push("        }".into());
-    out.push("".into());
-    out.push("        return $row ?? new $class();".into());
-    out.push("    }".into());
-    out.push(String::new());
-    out.push("    /** The old app's type; null passes (the test data may lack what the old app's data had). */".into());
-    out.push(format!(
-        "    private function assertParityType(string $expected, $value){ret}"
-    ));
-    out.push("    {".into());
-    out.push("        if ($value === null) {".into());
-    out.push("            $this->addToAssertionCount(1);".into());
-    out.push("        } elseif (class_exists($expected) || interface_exists($expected)) {".into());
-    out.push("            $this->assertInstanceOf($expected, $value);".into());
-    out.push("        } elseif (in_array($expected, ['integer', 'double'], true)) {".into());
-    out.push("            $this->assertIsNumeric($value);".into());
-    out.push("        } else {".into());
-    out.push("            $this->assertSame($expected, gettype($value));".into());
-    out.push("        }".into());
-    out.push("    }".into());
-    out.push("}".into());
-    out.join("\n") + "\n"
+        " * this marker so the tool leaves it alone (it then adds its tests in a block at the end).".into(),
+        " */".into(),
+    ]
 }
 
 /// Write the unit tests from the last probe. `skip` holds (test class, test method) to leave out (failing ones,
@@ -753,19 +754,28 @@ pub fn generate(config: &Config, skip: &HashSet<(String, String)>) -> Written {
     }
     for (class, rows) in by_class {
         let place = layout::place(config, Kind::Unit, &class);
-        let test_class = place.fqcn();
-        if place.file.exists()
-            && !std::fs::read_to_string(&place.file)
-                .unwrap_or_default()
-                .contains(MARKER)
-        {
-            written.cannot.push((
-                class.clone(),
-                format!("{} was edited by hand (no marker)", place.class),
-            ));
-            continue;
-        }
-        let mut taken = HashSet::new();
+        let existing = std::fs::read_to_string(&place.file).ok();
+        // a test file the app already has: the generated tests go in a block at the end of its class
+        let test_class = match existing.as_deref() {
+            Some(text) if !testfile::owned(text) => {
+                if let Err(why) = testfile::usable(text) {
+                    // counted per method, as every other method that gets no test
+                    let why = format!("{}.php {why}", place.class);
+                    written.cannot.extend(rows.iter().map(|r| {
+                        (
+                            format!("{class}::{}", r["method"].as_str().unwrap_or_default()),
+                            why.clone(),
+                        )
+                    }));
+                    continue;
+                }
+                testfile::class_of(text).unwrap_or_else(|| place.fqcn())
+            }
+            _ => place.fqcn(),
+        };
+        let mut taken = testgen::taken_names(existing.as_deref());
+        // the helpers the generated tests call
+        taken.extend(["fakeOutsideWorld", "generatedRow", "assertGeneratedType"].map(String::from));
         let mut tests = vec![];
         for row in rows {
             let method = row["method"].as_str().unwrap_or_default();
@@ -790,13 +800,26 @@ pub fn generate(config: &Config, skip: &HashSet<(String, String)>) -> Written {
             tests.push((name, body));
         }
         if tests.is_empty() {
-            let _ = std::fs::remove_file(&place.file);
+            testfile::clear(&place.file);
             continue;
         }
         if let Some(parent) = place.file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&place.file, render(config, &place, &class, &tests));
+        let base = config
+            .tests
+            .unit_base_class
+            .as_deref()
+            .unwrap_or("Tests\\TestCase")
+            .trim_start_matches('\\');
+        let text = testfile::render(
+            existing.as_deref(),
+            &place,
+            &unit_doc(&class),
+            base,
+            &members(config, &tests),
+        );
+        let _ = std::fs::write(&place.file, text);
         written.files.push(place.file);
     }
     written
@@ -891,7 +914,7 @@ mod tests {
             relation,
             [
                 "        $result = (new \\App\\Models\\Unit())->owner();",
-                "        $this->assertParityType('Illuminate\\\\Database\\\\Eloquent\\\\Relations\\\\BelongsTo', $result);",
+                "        $this->assertGeneratedType('Illuminate\\\\Database\\\\Eloquent\\\\Relations\\\\BelongsTo', $result);",
                 "        $this->assertInstanceOf(\\App\\Models\\User::class, $result->getRelated());"
             ]
         );
@@ -915,7 +938,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             accessor[0],
-            "        $value = $this->parityRow(\\App\\Models\\Unit::class)->getAttribute('full_name');"
+            "        $value = $this->generatedRow(\\App\\Models\\Unit::class)->getAttribute('full_name');"
         );
         assert!(test_body(&row("x", "model", json!({"status": "threw"}))).is_none());
 
@@ -928,8 +951,8 @@ mod tests {
             test_body(&service).unwrap(),
             [
                 "        $subject = new \\App\\Services\\Rent(app(\\App\\Services\\Clock::class));",
-                "        $result = $subject->summary($this->parityRow(\\App\\Models\\Unit::class), \\Illuminate\\Support\\Carbon::now(), null, \\Illuminate\\Http\\Request::create('/', 'GET'));",
-                "        $this->assertParityType('array', $result);",
+                "        $result = $subject->summary($this->generatedRow(\\App\\Models\\Unit::class), \\Illuminate\\Support\\Carbon::now(), null, \\Illuminate\\Http\\Request::create('/', 'GET'));",
+                "        $this->assertGeneratedType('array', $result);",
                 "        $this->assertArrayHasKey('total', $result);",
                 "        $this->assertArrayHasKey('due', $result);"
             ]

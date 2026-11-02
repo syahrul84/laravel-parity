@@ -58,8 +58,13 @@ Docker is optional. Nothing is written to your real database. Built on
 - **Every method of the app's own classes** run on both apps (`units`): models (relations, scopes, accessors, and
   their table, fillable, hidden and casts), services, exports, notifications, helpers. What now throws or returns
   something else goes in the fix list; what the old app returned becomes a **unit test** next to the app's own
-  (`tests/Unit/Models/UnitParityTest.php` for `app/Models/Unit.php`; feature tests follow the controllers the same
-  way; `[tests] layout = "folder"` keeps them in one folder)
+  (`tests/Unit/Models/UnitTest.php` for `app/Models/Unit.php`; feature tests follow the controllers the same way;
+  `[tests] layout = "folder"` keeps them in one folder). When that test file already exists, the generated tests go
+  in a marked block at the end of its class: each run replaces only the block, everything else stays as written
+- **Factories for the models that have none** (Laravel 8+, `[tests] factories = false` turns it off): each required
+  column gets a value of its type, a column that points at another model gets one of its rows; every factory is
+  checked by making a row (rolled back) and fixed from the database's error, or not kept. The app's own factories
+  that cannot make a row are listed
 - A **coverage target** (`[tests] target`, default 80%): `gaps` lists the methods with the most lines no test runs and
   where their test belongs; an AI assistant on the MCP server writes those tests (`coverage_gaps`, `probe_code` to see
   what the old app does, `check_tests`) until the target is met

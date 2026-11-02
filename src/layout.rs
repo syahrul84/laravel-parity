@@ -1,14 +1,15 @@
 //! Where a generated test goes. "mirror" (the default) puts it next to the app's own tests, following app/:
-//! app/Http/Controllers/Admin/UnitController.php -> tests/Feature/Controllers/Admin/UnitControllerParityTest.php
+//! app/Http/Controllers/Admin/UnitController.php -> tests/Feature/Controllers/Admin/UnitControllerTest.php
 //! (or tests/Feature/Http/Controllers/... when the app's tests use that), app/Models/Unit.php ->
-//! tests/Unit/Models/UnitParityTest.php. "folder" puts every feature test in [tests] dir, as before.
+//! tests/Unit/Models/UnitTest.php. A test file of that name the app already has gets the generated tests in a block
+//! of its own (src/testfile.rs). "folder" puts every feature test in [tests] dir, as before.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::testgen::MARKER;
+use crate::testfile;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -101,7 +102,7 @@ fn clean(name: &str) -> String {
 /// Where the generated test for `fqcn` (a controller, a model, a service ...) goes.
 pub fn place(config: &Config, kind: Kind, fqcn: &str) -> Place {
     let repo = &config.new.repo;
-    let class = format!("{}ParityTest", clean(fqcn));
+    let class = format!("{}Test", clean(fqcn));
     if kind == Kind::Feature && config.tests.layout() == "folder" {
         return Place {
             file: repo.join(config.tests.dir()).join(format!("{class}.php")),
@@ -142,8 +143,8 @@ pub fn place(config: &Config, kind: Kind, fqcn: &str) -> Place {
     }
 }
 
-/// Remove the tool's own test files (with the marker) of this kind that this run did not write again: a route that
-/// got a test of its own, a method that is gone, or the old single-folder layout.
+/// Take out the generated tests of this kind that this run did not write again (a route that got a test of its own,
+/// a method that is gone, the old layout): a file the tool made goes, a file someone wrote loses only its block.
 pub fn remove_stale(config: &Config, kind: Kind, written: &[PathBuf]) -> usize {
     let tests = config.new.repo.join("tests");
     let mut files = vec![];
@@ -155,8 +156,7 @@ pub fn remove_stale(config: &Config, kind: Kind, written: &[PathBuf]) -> usize {
         if (kind == Kind::Unit) != in_unit || written.contains(&file) {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        if text.contains(MARKER) && std::fs::remove_file(&file).is_ok() {
+        if testfile::clear(&file) {
             removed += 1;
         }
     }
@@ -180,6 +180,7 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testgen::MARKER;
 
     fn config(repo: &Path, tests: &str) -> Config {
         let pairs = repo.join("pairs");
@@ -214,7 +215,7 @@ mod tests {
         );
         assert_eq!(
             p.file,
-            repo.join("tests/Feature/Http/Controllers/Admin/UnitControllerParityTest.php")
+            repo.join("tests/Feature/Http/Controllers/Admin/UnitControllerTest.php")
         );
         assert_eq!(
             p.namespace,
@@ -222,7 +223,7 @@ mod tests {
         );
         assert_eq!(
             p.fqcn(),
-            "Shop\\Tests\\Feature\\Http\\Controllers\\Admin\\UnitControllerParityTest"
+            "Shop\\Tests\\Feature\\Http\\Controllers\\Admin\\UnitControllerTest"
         );
         // the app keeps controller tests in tests/Feature/Controllers
         std::fs::create_dir_all(repo.join("tests/Feature/Controllers")).unwrap();
@@ -233,22 +234,19 @@ mod tests {
         );
         assert_eq!(
             p.file,
-            repo.join("tests/Feature/Controllers/Admin/UnitControllerParityTest.php")
+            repo.join("tests/Feature/Controllers/Admin/UnitControllerTest.php")
         );
         assert_eq!(p.namespace, "Shop\\Tests\\Feature\\Controllers\\Admin");
         let p = place(&c, Kind::Unit, "App\\Models\\Unit");
-        assert_eq!(p.file, repo.join("tests/Unit/Models/UnitParityTest.php"));
+        assert_eq!(p.file, repo.join("tests/Unit/Models/UnitTest.php"));
         assert_eq!(p.namespace, "Shop\\Tests\\Unit\\Models");
         assert_eq!(
             place(&c, Kind::Unit, "App\\Helper").file,
-            repo.join("tests/Unit/HelperParityTest.php")
+            repo.join("tests/Unit/HelperTest.php")
         );
         // closures and package controllers
         let p = place(&c, Kind::Feature, "Closure");
-        assert_eq!(
-            p.file,
-            repo.join("tests/Feature/Routes/ClosureParityTest.php")
-        );
+        assert_eq!(p.file, repo.join("tests/Feature/Routes/ClosureTest.php"));
         assert_eq!(
             place(
                 &c,
@@ -256,7 +254,7 @@ mod tests {
                 "Laravel\\Passport\\Http\\Controllers\\AccessTokenController"
             )
             .class,
-            "AccessTokenControllerParityTest"
+            "AccessTokenControllerTest"
         );
 
         let c = config(
@@ -268,14 +266,11 @@ mod tests {
             Kind::Feature,
             "App\\Http\\Controllers\\Admin\\UnitController",
         );
-        assert_eq!(
-            p.file,
-            repo.join("tests/Parity/UnitControllerParityTest.php")
-        );
+        assert_eq!(p.file, repo.join("tests/Parity/UnitControllerTest.php"));
         assert_eq!(p.namespace, "Tests\\Parity");
         assert_eq!(
             place(&c, Kind::Unit, "App\\Models\\Unit").file,
-            repo.join("tests/Unit/Models/UnitParityTest.php")
+            repo.join("tests/Unit/Models/UnitTest.php")
         );
     }
 
@@ -291,21 +286,34 @@ mod tests {
             path
         };
         let old = write("tests/Feature/Parity/UnitControllerParityTest.php", MARKER);
-        let kept = write(
-            "tests/Feature/Controllers/UnitControllerParityTest.php",
-            MARKER,
-        );
+        let kept = write("tests/Feature/Controllers/UnitControllerTest.php", MARKER);
         let mine = write(
             "tests/Feature/Parity/Extra/MineTest.php",
             "<?php // by hand",
         );
-        let unit = write("tests/Unit/Models/UnitParityTest.php", MARKER);
+        let unit = write("tests/Unit/Models/UnitTest.php", MARKER);
+        // someone's own test file with a generated block: only the block goes
+        let theirs = "<?php\nclass LeaseTest extends TestCase\n{\n    public function test_mine(): void {}\n}\n";
+        let place = Place {
+            file: repo.join("tests/Unit/Models/LeaseTest.php"),
+            namespace: "Tests\\Unit\\Models".into(),
+            class: "LeaseTest".into(),
+        };
+        let merged = testfile::render(
+            Some(theirs),
+            &place,
+            &[],
+            "Tests\\TestCase",
+            &["public function test_gone(): void {}".into()],
+        );
+        let lease = write("tests/Unit/Models/LeaseTest.php", &merged);
         assert_eq!(
             remove_stale(&c, Kind::Feature, std::slice::from_ref(&kept)),
             1
         );
         assert!(!old.exists() && kept.exists() && mine.exists() && unit.exists());
-        assert_eq!(remove_stale(&c, Kind::Unit, &[]), 1);
+        assert_eq!(remove_stale(&c, Kind::Unit, &[]), 2);
         assert!(!unit.exists());
+        assert_eq!(std::fs::read_to_string(&lease).unwrap(), theirs);
     }
 }
