@@ -19,6 +19,8 @@ runner each app's own PHP executes (embedded in the binary with `include_str!`).
   the stack trace.
 - Problem reports (`src/reports.rs`) are one per kind + step + normalised error line; routes, sides and versions are
   lists on that entry, and old ids stay as aliases so an issue already sent is found again.
+- Resolve paths with `paths::real` (never `canonicalize()` directly): Windows gives `\\?\C:\x`, which PHP cannot open.
+- `all` runs `check` first and stops when an app does not start or a guard's user is missing.
 - `build.rs` stamps `--version` with the commit and date (`+changes` for a modified checkout).
 - Each check writes its own `runs/<name>/<check>.json` and its `fixes()` turns it into fix-list items
   (`fixlist::build` collects them); `gate.rs` (CI) and `history.rs` (since last run, overview) read only those files.

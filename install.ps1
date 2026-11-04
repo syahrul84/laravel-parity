@@ -32,10 +32,27 @@ if ($userPath -notlike "*$BinDir*") {
     Write-Host "Added $BinDir to your PATH (open a new terminal)."
 }
 
+# another laravel-parity earlier on PATH (an older `cargo install`) would run instead of this one
+$first = Get-Command laravel-parity -All -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($first -and ($first.Source -ne $exe)) {
+    Write-Host "Warning: 'laravel-parity' on PATH starts $($first.Source), not $exe."
+    Write-Host "  Remove it (cargo uninstall laravel-parity), or put $BinDir earlier on PATH."
+}
+
 if (Get-Command claude -ErrorAction SilentlyContinue) {
-    claude mcp remove --scope user laravel-parity 2>$null | Out-Null
+    # Windows PowerShell 5.1 turns a native command's stderr into an error record, and "Stop" would end the script
+    # here on a first install ("No MCP server named laravel-parity"): nothing to remove is fine
+    $ErrorActionPreference = "Continue"
+    claude mcp remove --scope user laravel-parity *> $null
     claude mcp add --scope user laravel-parity -e "LARAVEL_PARITY_HOME=$HomeDir" -- "$exe" serve
-    Write-Host "Registered the MCP server with Claude Code (all projects)."
+    $added = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = "Stop"
+    if ($added) {
+        Write-Host "Registered the MCP server with Claude Code (all projects)."
+    } else {
+        Write-Host "Could not register the MCP server; run:"
+        Write-Host "  claude mcp add --scope user laravel-parity -e LARAVEL_PARITY_HOME=$HomeDir -- `"$exe`" serve"
+    }
 } else {
     Write-Host "Claude Code not found; register later with:"
     Write-Host "  claude mcp add --scope user laravel-parity -e LARAVEL_PARITY_HOME=$HomeDir -- `"$exe`" serve"

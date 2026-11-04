@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn mirror_and_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = &dir.path().canonicalize().unwrap();
+        let repo = &crate::paths::real(dir.path()).unwrap();
         std::fs::write(
             repo.join("composer.json"),
             r#"{"autoload": {"psr-4": {"App\\": "app/", "Database\\Factories\\": "database/factories/"}},
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn stale_files_go() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = &dir.path().canonicalize().unwrap();
+        let repo = &crate::paths::real(dir.path()).unwrap();
         let c = config(repo, "");
         let write = |rel: &str, text: &str| {
             let path = repo.join(rel);

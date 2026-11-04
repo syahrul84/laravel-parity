@@ -513,8 +513,19 @@ pub fn check(config: &Config) -> Res<Value> {
         .iter()
         .map(|r| r["hits"].as_array().map_or(0, Vec::len))
         .sum();
+    // a syntax check that did not run is not "0 errors"
+    let syntax = match result["lint"]["error"].as_str() {
+        Some(e) => format!("syntax NOT checked ({})", e.lines().next().unwrap_or(e)),
+        None => format!(
+            "{} syntax errors in {} files",
+            result["lint"]["errors"].as_array().map_or(0, Vec::len),
+            result["lint"]["files"]
+                .as_u64()
+                .map_or("?".into(), |n| n.to_string())
+        ),
+    };
     let line = format!(
-        "Code: {} routes to missing methods ({} new), {} upgrade-trap hits in {} rules, {} syntax errors in {} files{}",
+        "Code: {} routes to missing methods ({} new), {} upgrade-trap hits in {} rules, {syntax}{}",
         result["missing_code"]["new"].as_array().map_or(0, Vec::len)
             + result["missing_code"]["before"]
                 .as_array()
@@ -522,8 +533,6 @@ pub fn check(config: &Config) -> Res<Value> {
         result["missing_code"]["new"].as_array().map_or(0, Vec::len),
         hits,
         rules.len(),
-        result["lint"]["errors"].as_array().map_or(0, Vec::len),
-        result["lint"]["files"],
         if phpstan.is_some() {
             format!(", PHPStan {} errors", result["phpstan"]["errors"])
         } else {

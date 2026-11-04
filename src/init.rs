@@ -27,7 +27,7 @@ fn container_for(repo: &Path) -> Option<(String, String, bool)> {
     if !names.status.success() {
         return None;
     }
-    let repo = repo.canonicalize().ok()?;
+    let repo = crate::paths::real(repo).ok()?;
     let mut candidates = vec![];
     for line in String::from_utf8_lossy(&names.stdout).lines() {
         let Some((name, state)) = line.split_once('|') else {
@@ -48,7 +48,7 @@ fn container_for(repo: &Path) -> Option<(String, String, bool)> {
             let Some((source, destination)) = mount.split_once('|') else {
                 continue;
             };
-            if Path::new(source).canonicalize().ok().as_deref() == Some(repo.as_path()) {
+            if crate::paths::real(Path::new(source)).ok().as_deref() == Some(repo.as_path()) {
                 candidates.push((
                     name.to_string(),
                     destination.to_string(),
@@ -178,8 +178,8 @@ pub fn init(
             ));
         }
     }
-    let old = old.canonicalize().map_err(|e| e.to_string())?;
-    let new = new.canonicalize().map_err(|e| e.to_string())?;
+    let old = crate::paths::real(old).map_err(|e| e.to_string())?;
+    let new = crate::paths::real(new).map_err(|e| e.to_string())?;
     let name = name
         .map(String::from)
         .unwrap_or_else(|| {
@@ -371,7 +371,7 @@ pub fn tool_root() -> PathBuf {
     }
     let exe = std::env::current_exe()
         .ok()
-        .and_then(|e| e.canonicalize().ok())
+        .and_then(|e| crate::paths::real(&e).ok())
         .unwrap_or_default();
     let mut dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     for _ in 0..3 {

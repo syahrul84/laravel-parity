@@ -149,10 +149,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `C:\x` for `\\?\C:\x` (what canonicalize gives on Windows).
 fn shown(p: &Path) -> String {
-    let s = p.display().to_string();
-    s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s)
+    crate::paths::plain(p.to_path_buf()).display().to_string()
 }
 
 /// The previous program, kept beside the new one on Windows (a running program can be renamed there, not replaced).
@@ -206,8 +204,8 @@ fn shadowed_by(exe: &Path, path: &std::ffi::OsStr) -> Option<PathBuf> {
     let first = std::env::split_paths(path)
         .map(|dir| dir.join(&name))
         .find(|p| p.is_file())?;
-    let first = first.canonicalize().unwrap_or(first);
-    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let first = crate::paths::real(&first).unwrap_or(first);
+    let exe = crate::paths::real(exe).unwrap_or_else(|_| exe.to_path_buf());
     (first != exe).then_some(first)
 }
 
@@ -242,7 +240,7 @@ fn path_warning(exe: &Path) -> String {
 pub fn run(check_only: bool) -> Result<String, String> {
     clean_old_copy();
     let here = std::env::current_exe()
-        .and_then(|e| e.canonicalize())
+        .and_then(|e| crate::paths::real(&e))
         .map_err(|e| e.to_string())?;
     let tag = latest(20)?;
     let _ = std::fs::create_dir_all(cache().parent().unwrap());
@@ -348,7 +346,7 @@ mod tests {
     #[test]
     fn finds_another_copy_first_on_path() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = crate::paths::real(dir.path()).unwrap();
         let name = format!("laravel-parity{}", std::env::consts::EXE_SUFFIX);
         let (cargo, mine, empty) = (root.join("cargo-bin"), root.join("bin"), root.join("other"));
         for d in [&cargo, &mine, &empty] {

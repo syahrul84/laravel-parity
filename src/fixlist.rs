@@ -434,6 +434,20 @@ pub fn build(config: &Config) -> Res<Vec<Fix>> {
                 details: hits,
             });
         }
+        if let Some(error) = code["lint"]["error"].as_str() {
+            add(Fix {
+                priority: 4,
+                area: "Not checked".into(),
+                title: "The syntax of the new app's files could not be checked: the new PHP did not run".into(),
+                location: None,
+                hint: Some(
+                    "Run `laravel-parity check` to see why the new app's PHP cannot start, fix it, then `laravel-parity code` again."
+                        .into(),
+                ),
+                routes: vec![],
+                details: vec![error.lines().next().unwrap_or(error).to_string()],
+            });
+        }
         let lint_errors = items(&code["lint"]["errors"]);
         if !lint_errors.is_empty() {
             add(Fix {

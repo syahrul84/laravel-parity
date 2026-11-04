@@ -21,6 +21,7 @@ mod log;
 mod logs;
 mod mcp;
 mod ops;
+mod paths;
 mod plan;
 mod report;
 mod reports;
@@ -250,7 +251,13 @@ fn main() {
             resume,
             workers,
         } => ops::run(&load(&pair), only.as_deref(), resume, workers).map(drop),
-        Command::Code { pair } => code::check(&load(&pair)).map(drop),
+        // a syntax check that could not run fails the command, so CI does not read it as clean
+        Command::Code { pair } => {
+            code::check(&load(&pair)).and_then(|r| match r["lint"]["error"].as_str() {
+                Some(e) => Err(format!("the syntax check did not run: {e}")),
+                None => Ok(()),
+            })
+        }
         Command::Web { pair } => web::check(&load(&pair)).map(drop),
         Command::Report { pair } => ops::report(&load(&pair)).map(drop),
         Command::Schema { pair } => schema::check(&load(&pair)).map(drop),

@@ -263,7 +263,7 @@ pub fn env_value(repo: &Path, key: &str) -> Option<String> {
 fn side(label: &'static str, raw: RawSide, shared: &RawDb, database: String) -> Side {
     let own = raw.database;
     let repo = expand(&raw.repo);
-    let repo = repo.canonicalize().unwrap_or(repo);
+    let repo = crate::paths::real(&repo).unwrap_or(repo);
     let php = match (raw.container, raw.php) {
         (Some(container), _) => Php::Docker { container },
         (None, Some(php)) => Php::Local {
@@ -313,9 +313,7 @@ fn side(label: &'static str, raw: RawSide, shared: &RawDb, database: String) -> 
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
-    let path = path
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let path = crate::paths::real(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let raw: Raw = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = raw
@@ -476,7 +474,7 @@ mod tests {
         assert_eq!(c.new.database, "shop_parity_new");
         assert_eq!(c.source_db, "shop");
         assert_eq!(c.db_user, "root");
-        let root = path.canonicalize().unwrap();
+        let root = crate::paths::real(&path).unwrap();
         let root = root.parent().unwrap().parent().unwrap();
         assert_eq!(c.work, root.join("runs").join("shop"));
         assert_eq!(c.clock, "auto");
@@ -679,7 +677,7 @@ mod tests {
         let c = load(&path).unwrap();
         assert_eq!(c.source_db, "shop");
         assert_eq!(c.db_user, "shop_user");
-        assert_eq!(c.old.repo, repo.canonicalize().unwrap());
+        assert_eq!(c.old.repo, crate::paths::real(&repo).unwrap());
     }
 
     #[test]

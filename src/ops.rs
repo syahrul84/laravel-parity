@@ -1199,8 +1199,38 @@ pub fn check(config: &Config) -> Res<Value> {
     Ok(found)
 }
 
+/// What keeps `all` from going on after `check`: an app that gave no answer, a guard whose user does not exist (a
+/// token that could not be made is not one: the guard still signs in).
+fn start_problems(config: &Config, found: &Value) -> Vec<String> {
+    let mut problems = vec![];
+    for side in [&config.old, &config.new] {
+        let Some(answer) = found.get(side.label) else {
+            problems.push(format!("the {} app did not start", side.label));
+            continue;
+        };
+        for (guard, note) in answer["sign_in_problems"].as_object().into_iter().flatten() {
+            let note = note.as_str().unwrap_or_default();
+            if note.starts_with("no user ") {
+                problems.push(format!("{} app, guard {guard}: {note}", side.label));
+            }
+        }
+    }
+    problems
+}
+
 pub fn all(config: &Config, workers: Option<usize>) -> Res<String> {
     setup_db(config, false)?;
+    // both apps must start and sign in before anything is built on them (the guide's first step)
+    let found = check(config).map_err(|e| {
+        format!("stopped after check: {e}\nFix that, run `laravel-parity check` until both apps start, then `all` again.")
+    })?;
+    let problems = start_problems(config, &found);
+    if !problems.is_empty() {
+        return Err(format!(
+            "stopped after check: {}\nFix that, run `laravel-parity check` until both apps start and sign in, then `all` again.",
+            problems.join("; ")
+        ));
+    }
     routes(config)?;
     crate::code::check(config)?;
     crate::schema::check(config)?;
@@ -1213,4 +1243,36 @@ pub fn all(config: &Config, workers: Option<usize>) -> Res<String> {
     // after the run: the channel names come from what the requests and commands broadcast
     crate::channels::check(config)?;
     tests(config, true, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_stops_on_an_app_that_cannot_start_or_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let file = repo.join("shop.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "[old]\nrepo = '{0}'\nphp = 'php'\n[new]\nrepo = '{0}'\nphp = 'php'\n[database]\nsource = 'shop'\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let config = crate::config::load(&file).unwrap();
+        let fine = json!({"old": {"sign_in_problems": {"api": "token not made (x); signed in through the guard only"}},
+                          "new": {"sign_in_problems": {}}});
+        assert!(start_problems(&config, &fine).is_empty());
+        let broken = json!({"old": {"sign_in_problems": {"admin": "no user 7 for guard admin"}}});
+        assert_eq!(
+            start_problems(&config, &broken),
+            [
+                "old app, guard admin: no user 7 for guard admin",
+                "the new app did not start"
+            ]
+        );
+    }
 }
