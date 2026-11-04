@@ -26,6 +26,11 @@ file_put_contents("$dir/job.json", json_encode([
         ['id' => 'ping', 'method' => 'GET', 'uri' => 'parity/ping'],
         ['id' => 'valid', 'method' => 'GET', 'uri' => 'parity/validate', 'query' => ['name' => 'ok']],
         ['id' => 'invalid', 'method' => 'GET', 'uri' => 'parity/validate'],
+        // a request that changes a PHP setting, then one that must still start the app (its .env parses)
+        ['id' => 'spoil', 'method' => 'GET', 'uri' => 'parity/spoil'],
+        ['id' => 'after', 'method' => 'GET', 'uri' => 'parity/ping'],
+        // the app ends the process: recorded as this request's answer, the app's doing (last: nothing runs after it)
+        ['id' => 'exit', 'method' => 'GET', 'uri' => 'parity/exit'],
     ],
 ]));
 
@@ -48,7 +53,8 @@ foreach ($info['capabilities'] ?? [] as $name => $ok) {
 if (empty($info['capabilities'])) {
     $failures[] = 'the runner did not report its capabilities (exit '.$code.')';
 }
-$expect = ['ping' => 200, 'valid' => 200, 'invalid' => 422];
+// spoil's own answer is whatever the app does with that setting; the next request must not inherit it
+$expect = ['ping' => 200, 'valid' => 200, 'invalid' => 422, 'after' => 200];
 foreach ($expect as $id => $status) {
     $got = $rows[$id]['status'] ?? 'nothing';
     echo "$id: $got (expected $status)\n";
@@ -58,6 +64,11 @@ foreach ($expect as $id => $status) {
 }
 if (($rows['invalid']['json']['errors']['name'] ?? null) === null) {
     $failures[] = 'the 422 answer has no validation error for name';
+}
+$exit = $rows['exit'] ?? [];
+echo 'exit: '.($exit['error'] ?? 'nothing')." (exit code $code)\n";
+if (($exit['cause'] ?? null) !== 'app' || empty($exit['stopped']) || strpos($exit['error'] ?? '', 'bye') === false || $code !== 75) {
+    $failures[] = 'the request that called exit was not recorded as the app ending the process (with what it printed, exit 75): '.json_encode($exit);
 }
 
 // the other modes: list commands / jobs / schedule, run one command, ask the broadcast channels

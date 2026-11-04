@@ -11,6 +11,13 @@ use sha2::{Digest, Sha256};
 use crate::reports::REPO;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version with the commit and date it was built from (build.rs): two builds of one version differ here.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("LARAVEL_PARITY_BUILD"),
+    ")"
+);
 
 /// The release file for this machine.
 fn asset() -> Option<&'static str> {
@@ -193,8 +200,50 @@ fn replace_exe(new: &Path, exe: &Path) -> std::io::Result<()> {
     result
 }
 
+/// The first `laravel-parity` on PATH, when it is not this program: running `laravel-parity` starts that one.
+fn shadowed_by(exe: &Path, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let name = format!("laravel-parity{}", std::env::consts::EXE_SUFFIX);
+    let first = std::env::split_paths(path)
+        .map(|dir| dir.join(&name))
+        .find(|p| p.is_file())?;
+    let first = first.canonicalize().unwrap_or(first);
+    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    (first != exe).then_some(first)
+}
+
+/// A warning when another laravel-parity earlier on PATH runs instead of `exe`, with the version it says.
+fn path_warning(exe: &Path) -> String {
+    let Some(other) = std::env::var_os("PATH").and_then(|path| shadowed_by(exe, &path)) else {
+        return String::new();
+    };
+    let said = Command::new(&other)
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let fix = if other.components().any(|c| c.as_os_str() == ".cargo") {
+        "remove it with `cargo uninstall laravel-parity`".to_string()
+    } else {
+        "remove it".to_string()
+    };
+    format!(
+        "\nWarning: `laravel-parity` on PATH starts {} ({}), not {}. {fix}, or put {} earlier on PATH.",
+        shown(&other),
+        if said.is_empty() {
+            "version unknown"
+        } else {
+            &said
+        },
+        shown(exe),
+        exe.parent().map(shown).unwrap_or_default()
+    )
+}
+
 pub fn run(check_only: bool) -> Result<String, String> {
     clean_old_copy();
+    let here = std::env::current_exe()
+        .and_then(|e| e.canonicalize())
+        .map_err(|e| e.to_string())?;
     let tag = latest(20)?;
     let _ = std::fs::create_dir_all(cache().parent().unwrap());
     let _ = std::fs::write(
@@ -203,12 +252,16 @@ pub fn run(check_only: bool) -> Result<String, String> {
     );
     let new = tag.trim_start_matches('v').to_string();
     if !is_newer(&tag, VERSION) {
-        return Ok(format!("laravel-parity {VERSION} is the latest version."));
+        return Ok(format!(
+            "laravel-parity {LONG_VERSION} is the latest version.{}",
+            path_warning(&here)
+        ));
     }
     let notes = format!("Release notes: https://github.com/{REPO}/releases/tag/{tag}");
     if check_only {
         return Ok(format!(
-            "laravel-parity {new} is available (this is {VERSION}). {notes}\nRun `laravel-parity update` to install it."
+            "laravel-parity {new} is available (this is {LONG_VERSION}). {notes}\nRun `laravel-parity update` to install it.{}",
+            path_warning(&here)
         ));
     }
     let Some(asset) = asset() else {
@@ -259,9 +312,7 @@ pub fn run(check_only: bool) -> Result<String, String> {
             said.trim()
         ));
     }
-    let exe = std::env::current_exe()
-        .and_then(|e| e.canonicalize())
-        .map_err(|e| e.to_string())?;
+    let exe = here;
     let result = replace_exe(&unpacked, &exe);
     let _ = std::fs::remove_dir_all(&work);
     if let Err(e) = result {
@@ -275,15 +326,45 @@ pub fn run(check_only: bool) -> Result<String, String> {
             shown(&exe)
         ));
     }
+    let kept = if cfg!(windows) {
+        format!(
+            "\nThe previous program is kept as {} until laravel-parity next starts, which removes it.",
+            shown(&old_copy(&exe))
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "Updated {} to {new}. {notes}\nAI sessions use it from their next start (or restart the MCP server).",
-        shown(&exe)
+        "Updated {} to {new}. {notes}\nAI sessions use it from their next start (or restart the MCP server).{kept}{}",
+        shown(&exe),
+        path_warning(&exe)
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_another_copy_first_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let name = format!("laravel-parity{}", std::env::consts::EXE_SUFFIX);
+        let (cargo, mine, empty) = (root.join("cargo-bin"), root.join("bin"), root.join("other"));
+        for d in [&cargo, &mine, &empty] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(cargo.join(&name), "old").unwrap();
+        std::fs::write(mine.join(&name), "new").unwrap();
+        let exe = mine.join(&name);
+        let path = |dirs: &[&PathBuf]| std::env::join_paths(dirs.iter()).unwrap();
+        assert_eq!(
+            shadowed_by(&exe, &path(&[&empty, &cargo, &mine])),
+            Some(cargo.join(&name))
+        );
+        assert_eq!(shadowed_by(&exe, &path(&[&empty, &mine, &cargo])), None);
+        assert_eq!(shadowed_by(&exe, &path(&[&empty])), None);
+    }
 
     #[test]
     fn replaces_the_program() {

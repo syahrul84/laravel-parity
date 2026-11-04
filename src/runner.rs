@@ -3,8 +3,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::config::{Config, Php, Side};
@@ -262,20 +264,12 @@ pub fn run_job_timed(
     }
     if !output.status.success() || rows.is_empty() {
         // Laravel's console error handler can exit 0 after printing, so no output at all is a failure too
-        let text = String::from_utf8_lossy(if output.stderr.is_empty() {
-            &output.stdout
-        } else {
-            &output.stderr
-        });
-        let detail: String = text
-            .trim()
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let detail = crash_summary(&text, output.status.code(), signal(&output.status));
         if rows.is_empty() {
             return Err(format!(
                 "runner failed for the {} app (exit {:?}): {detail}",
@@ -286,6 +280,45 @@ pub fn run_job_timed(
         rows.push(json!({"runner_crash": detail, "exit": output.status.code()}));
     }
     Ok(rows)
+}
+
+#[cfg(unix)]
+fn signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// What a PHP process that stopped said: the line that names the error (a fatal error, an uncaught exception) with
+/// its file:line, not the stack trace under it; else the first line it printed; else how it ended (exit code or
+/// signal: through docker a signal shows as 128 + its number).
+pub fn crash_summary(text: &str, code: Option<i32>, signal: Option<i32>) -> String {
+    static ERROR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)fatal error|parse error|uncaught|\b\w*(exception|error)\b\s*:").unwrap()
+    });
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("Stack trace"))
+        .collect();
+    if let Some(line) = lines.iter().find(|l| ERROR.is_match(l)).or(lines.first()) {
+        return line.chars().take(500).collect();
+    }
+    match (code, signal) {
+        (_, Some(9)) | (Some(137), _) => {
+            "PHP printed nothing and was killed (signal 9: usually out of memory)".into()
+        }
+        (_, Some(11)) | (Some(139), _) => {
+            "PHP printed nothing and crashed (segmentation fault)".into()
+        }
+        (_, Some(s)) => format!("PHP printed nothing and was stopped by signal {s}"),
+        (Some(c), _) => format!("PHP printed nothing and exited with code {c}"),
+        (None, None) => "PHP printed nothing and stopped".into(),
+    }
 }
 
 /// A shell command in the app's folder (PHPUnit), with the app's PHP.
@@ -380,4 +413,38 @@ fn write_private(path: &PathBuf, text: &str) -> Result<(), String> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_summaries() {
+        // the error line, not the stack trace under it
+        let fatal = "PHP Fatal error:  Cannot redeclare build_calendar() (previously declared in /app/storage/framework/views/abc.php:12) in /app/storage/framework/views/abc.php on line 12\nStack trace:\n#0 /app/vendor/laravel/framework/src/Illuminate/Pipeline/Pipeline.php(180): x()\n#64 /app/vendor/laravel/framework/src/Illuminate/Foundation/Http/Kernel.php(175): Illuminate\\Pipeline\\Pipeline->then()\n";
+        assert!(
+            crash_summary(fatal, Some(255), None)
+                .starts_with("PHP Fatal error:  Cannot redeclare build_calendar()")
+        );
+        let uncaught = "\nPHP Warning:  something\nPHP Fatal error:  Uncaught RuntimeException: boom in /app/app/X.php:3\n#0 {main}\n";
+        assert_eq!(
+            crash_summary(uncaught, Some(255), None),
+            "PHP Fatal error:  Uncaught RuntimeException: boom in /app/app/X.php:3"
+        );
+        assert_eq!(crash_summary("just this\n", Some(1), None), "just this");
+        // nothing printed: say how it ended
+        assert_eq!(
+            crash_summary("\n", Some(137), None),
+            "PHP printed nothing and was killed (signal 9: usually out of memory)"
+        );
+        assert_eq!(
+            crash_summary("", None, Some(11)),
+            "PHP printed nothing and crashed (segmentation fault)"
+        );
+        assert_eq!(
+            crash_summary("", Some(0), None),
+            "PHP printed nothing and exited with code 0"
+        );
+    }
 }

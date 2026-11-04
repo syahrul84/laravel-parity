@@ -439,8 +439,13 @@ fn build_route(
         .trim_end_matches('/')
         .to_string();
 
+    // the expectations were recorded with every middleware on: a class that `use WithoutMiddleware` would let a guest
+    // case through the auth middleware it expects to stop it
+    lines.push("$this->withMiddleware();".into());
     lines.push("$user = null;".into());
-    if let Some(guard) = &happy.guard {
+    // the guard of any case that signs in: with --drop-failing the happy case may be gone while a signed-in one
+    // (missing record ...) stays
+    if let Some(guard) = cases.iter().find_map(|s| s.guard.as_ref()) {
         let acting = tests
             .acting_as
             .get(guard)
@@ -1087,6 +1092,49 @@ mod tests {
             action: action.map(String::from),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn dropping_the_happy_case_keeps_the_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(
+            dir.path(),
+            "[tests]\nlayout = 'folder'\nacting_as = { api = '$user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");' }\n",
+        );
+        let action = Some("App\\Http\\Controllers\\PingController@show");
+        let specs = vec![
+            spec("h", "GET api/ping", "happy", action),
+            spec("g", "GET api/ping", "guest", action),
+            spec("e", "GET api/ping", "empty", action),
+        ];
+        let old_rows: HashMap<String, Value> = [("h", 200), ("g", 401), ("e", 200)]
+            .into_iter()
+            .map(|(k, s)| {
+                (
+                    k.to_string(),
+                    json!({"status": s, "kind": "json", "json": {}}),
+                )
+            })
+            .collect();
+        let untested: BTreeSet<String> = ["GET api/ping".to_string()].into();
+        // the happy case failed and --drop-failing took it out
+        let skip = HashSet::from([(
+            "Tests\\Feature\\Parity\\PingControllerTest".to_string(),
+            "test_get_api_ping#happy".to_string(),
+        )]);
+        let out = generate(
+            &config,
+            &specs,
+            &old_rows,
+            &untested,
+            &BTreeMap::new(),
+            &skip,
+        );
+        let php = std::fs::read_to_string(&out.files[0]).unwrap();
+        assert!(php.contains("        $this->withMiddleware();\n        $user = null;\n        if ($signIn) {\n            $user = \\App\\Models\\User::factory()->create();"));
+        assert!(!php.contains("'happy' =>"));
+        assert!(php.contains("'empty' => [true, false,"));
+        assert!(php.contains("'guest' => [false, false,"));
     }
 
     #[test]

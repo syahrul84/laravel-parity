@@ -44,6 +44,18 @@ if (! defined('LARAVEL_START')) {
     define('LARAVEL_START', microtime(true));
 }
 
+// PHP-FPM starts every request with the settings the pool started with; this process runs many requests, so it puts
+// back what one request changed (ini_set('pcre.backtrack_limit', 0) in a PDF export broke the next request's .env)
+$GLOBALS['parity_start'] = array(
+    'ini' => ini_get_all(null, false),
+    'timezone' => date_default_timezone_get(),
+    'locale' => setlocale(LC_ALL, 0),
+    'encoding' => function_exists('mb_internal_encoding') ? mb_internal_encoding() : null,
+);
+// the request this process is on (a shutdown mid-request records what ended it), and how many it finished
+$GLOBALS['parity_current'] = null;
+$GLOBALS['parity_served'] = 0;
+
 /** Records what the app broadcasts right away (ShouldBroadcastNow); queued broadcasts are read from the queue fake. */
 class ParityBroadcaster extends Illuminate\Broadcasting\Broadcasters\Broadcaster
 {
@@ -125,6 +137,64 @@ function parity_emit($out, array $row)
     $json = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
     fwrite($out, $json."\n");
     fflush($out);
+}
+
+/** Put back the PHP settings, timezone, locale and encoding the process started with. */
+function parity_reset_process()
+{
+    $start = $GLOBALS['parity_start'];
+    foreach (ini_get_all(null, false) as $key => $value) {
+        if (array_key_exists($key, $start['ini']) && $start['ini'][$key] !== $value && $start['ini'][$key] !== null) {
+            @ini_set($key, (string) $start['ini'][$key]);
+        }
+    }
+    @date_default_timezone_set($start['timezone']);
+    if (is_string($start['locale'])) {
+        @setlocale(LC_ALL, $start['locale']);
+    }
+    if ($start['encoding'] !== null) {
+        @mb_internal_encoding($start['encoding']);
+    }
+}
+
+/** A file of the app's own code (not vendor/, not this runner): what it does is the route's answer. */
+function parity_own_file($file, $appPath)
+{
+    $file = str_replace('\\', '/', (string) $file);
+    $root = str_replace('\\', '/', $appPath).'/';
+    return strpos($file, $root) === 0 && strpos($file, $root.'vendor/') !== 0 && basename($file) !== 'replay.php';
+}
+
+/**
+ * The process ended in the middle of a request: a fatal error, or the app's own exit / die / dd(). Record what ended
+ * it as that request's answer (with what it printed) and exit with 75, so the tool runs the rest in a new process.
+ */
+function parity_shutdown($out, $appPath)
+{
+    $id = $GLOBALS['parity_current'];
+    if ($id === null) {
+        return;
+    }
+    @ini_set('memory_limit', '-1');
+    $printed = '';
+    while (ob_get_level() > 0) {
+        $printed = ob_get_clean().$printed;
+    }
+    $error = error_get_last();
+    $fatal = $error !== null && in_array($error['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR), true);
+    $row = array('id' => $id, 'status' => 'runner-error', 'stopped' => true);
+    if ($fatal) {
+        $message = strtok($error['message'], "\n");
+        $row['error'] = 'PHP fatal error: '.$message.' at '.$error['file'].':'.$error['line'];
+        $row['cause'] = parity_own_file($error['file'], $appPath) ? 'app' : 'unknown';
+    } else {
+        // nothing failed: the app's code ended the process (exit, die, dd(), dump-and-die)
+        $row['error'] = 'the app ended the process during this request (exit, die or dd)'
+            .($printed !== '' ? ', after printing: '.substr(trim(preg_replace('/\s+/', ' ', strip_tags($printed))), 0, 300) : ', printing nothing');
+        $row['cause'] = 'app';
+    }
+    parity_emit($out, $row);
+    exit(75);
 }
 
 /** A fresh application, bootstrapped and repointed at the test database. */
@@ -472,6 +542,7 @@ function parity_finish($app, $connection, array $row, $started)
     }
     $app->flush();
     Illuminate\Support\Facades\Facade::clearResolvedInstances();
+    parity_reset_process();
 
     return $row;
 }
@@ -499,7 +570,17 @@ function parity_request($appPath, array $job, array $spec, array $tokens)
         $method === 'GET' || $body === null ? null : json_encode($body)
     );
 
-    list($app, $kernel) = parity_boot($appPath, $job, false, $request);
+    try {
+        list($app, $kernel) = parity_boot($appPath, $job, false, $request);
+    } catch (Throwable $e) {
+        if ($GLOBALS['parity_served'] > 0) {
+            // the app started for the requests before this one: something they left in the process broke it, not
+            // this route; a new process runs it again
+            $GLOBALS['parity_current'] = null;
+            exit(75);
+        }
+        throw $e;
+    }
     parity_record($app, $job);
 
     if ($guard && empty($tokens[$guard]) && isset($job['users'][$guard])) {
@@ -523,7 +604,8 @@ function parity_request($appPath, array $job, array $spec, array $tokens)
         $row = array_merge($row, parity_response($response));
     } catch (Throwable $e) {
         $row['status'] = 'runner-error';
-        $row['error'] = get_class($e).': '.$e->getMessage();
+        $row['error'] = get_class($e).': '.strtok($e->getMessage(), "\n").' at '.$e->getFile().':'.$e->getLine();
+        $row['cause'] = parity_own_file($e->getFile(), $appPath) ? 'app' : 'unknown';
     }
     $printed = '';
     while (ob_get_level() > $level) {
@@ -1327,12 +1409,20 @@ list($tokens, $notes) = parity_tokens($app, $job);
 parity_emit($out, array('info' => parity_info($app), 'auth' => $notes));
 $app->flush();
 
+register_shutdown_function('parity_shutdown', $out, $appPath);
+parity_reset_process();
 foreach ((array) $job['requests'] as $spec) {
+    $GLOBALS['parity_current'] = $spec['id'];
     try {
-        parity_emit($out, parity_request($appPath, $job, $spec, $tokens));
+        $row = parity_request($appPath, $job, $spec, $tokens);
     } catch (Throwable $e) {
-        parity_emit($out, array('id' => $spec['id'], 'status' => 'runner-error', 'error' => get_class($e).': '.$e->getMessage()));
+        $row = array('id' => $spec['id'], 'status' => 'runner-error',
+            'error' => 'while starting the app: '.get_class($e).': '.strtok($e->getMessage(), "\n").' at '.$e->getFile().':'.$e->getLine());
+        parity_reset_process();
     }
+    $GLOBALS['parity_current'] = null;
+    $GLOBALS['parity_served']++;
+    parity_emit($out, $row);
     // a library closed our output buffer and printed straight out (SimpleXLSXGen downloadAs): from now on PHP
     // reports headers as sent for every request in this process. Stop; the tool runs the rest in a fresh process.
     if (headers_sent()) {

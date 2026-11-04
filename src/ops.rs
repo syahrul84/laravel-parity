@@ -329,7 +329,7 @@ fn run_side(
                     }
                 } else if let Some(victim) = missing.first() {
                     let error_row = json!({"id": victim.id, "status": "runner-error",
-                                           "error": format!("PHP stopped on this request: {}", tail(&crash, 500))});
+                                           "error": format!("PHP stopped on this request: {crash}")});
                     lines += &(error_row.to_string() + "\n");
                     counted += 1;
                     if missing.len() > 1 {
@@ -532,7 +532,9 @@ fn auto_reports(config: &Config, meta: &Value, run: &[Spec]) {
         .collect();
     for side in ["old", "new"] {
         for (id, row) in jsonl(&config.work.join(format!("results-{side}.jsonl"))) {
-            if row["status"] == "runner-error" {
+            // the app's own code (dd, exit, a fatal error in app/ or a view) is the route's answer, not a problem
+            // with the tool
+            if row["status"] == "runner-error" && row["cause"] != "app" {
                 crate::reports::add(crate::reports::New {
                     kind: "runner-crash",
                     source: "auto",

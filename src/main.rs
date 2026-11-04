@@ -43,7 +43,7 @@ pub use crate::log::say;
 #[derive(Parser)]
 #[command(
     name = "laravel-parity",
-    version,
+    version = update::LONG_VERSION,
     about = "Run the same requests through an old and an upgraded Laravel app and report what differs",
     after_help = "New here? Run `laravel-parity guide`."
 )]

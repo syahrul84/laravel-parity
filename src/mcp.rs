@@ -922,7 +922,7 @@ pub fn serve() {
                 json!({
                     "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "laravel-parity", "version": env!("CARGO_PKG_VERSION")},
+                    "serverInfo": {"name": "laravel-parity", "version": crate::update::LONG_VERSION},
                     "instructions": guide::MCP_INSTRUCTIONS,
                 }),
             ),

@@ -11,6 +11,15 @@ runner each app's own PHP executes (embedded in the binary with `include_str!`).
   properties, match, `str_contains`, nullsafe. Every Laravel internal it reads goes in `parity_capabilities()`;
   `tests/fixtures/check-runner.php` is the CI check of the runner on each Laravel version (every mode: replay,
   console, console-run, channels, units, probe; artisan, routes and lint are used by setup-db, web and code).
+- The runner serves many requests in one PHP process: `parity_reset_process()` puts back the ini settings, timezone,
+  locale and encoding the process started with after each one (as PHP-FPM does). A request whose app fails to start
+  after earlier ones succeeded exits 75 and runs again in a new process. If PHP ends mid-request (the app's `exit`,
+  `dd()`, a fatal error), the shutdown handler records it as that request's answer, with `cause: "app"` when the code
+  is the app's own; such rows are never saved as problem reports. `runner::crash_summary` keeps the error line, not
+  the stack trace.
+- Problem reports (`src/reports.rs`) are one per kind + step + normalised error line; routes, sides and versions are
+  lists on that entry, and old ids stay as aliases so an issue already sent is found again.
+- `build.rs` stamps `--version` with the commit and date (`+changes` for a modified checkout).
 - Each check writes its own `runs/<name>/<check>.json` and its `fixes()` turns it into fix-list items
   (`fixlist::build` collects them); `gate.rs` (CI) and `history.rs` (since last run, overview) read only those files.
 - `php/ParityRecorder.php` is the middleware `laravel-parity recorder` hands out for the OLD app (same PHP 7.1 rule);

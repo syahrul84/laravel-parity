@@ -14,3 +14,16 @@ Route::get('/parity/validate', function (Request $request) {
 
     return response()->json(['name' => $request->input('name')]);
 });
+
+// a PDF export of the kind that broke the next request: under PHP-FPM this setting ends with the request
+Route::get('/parity/spoil', function () {
+    ini_set('pcre.backtrack_limit', '0');
+
+    return response()->json(['spoiled' => true]);
+});
+
+// the app's own code ending the process (a dd() left in a controller does the same)
+Route::get('/parity/exit', function () {
+    echo 'bye';
+    exit;
+});
