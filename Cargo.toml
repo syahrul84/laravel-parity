@@ -1,6 +1,6 @@
 [package]
 name = "laravel-parity"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 description = "Runs the same requests through an old and an upgraded Laravel app and reports what differs"
 license = "MIT"

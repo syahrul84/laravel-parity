@@ -667,6 +667,7 @@ fn members(config: &Config, tests: &[(String, Vec<String>)]) -> Vec<String> {
         }
         lines.push(format!("public function {name}(){ret}"));
         lines.push("{".into());
+        lines.push(format!("    $this->{}();", testgen::ROLLBACK));
         lines.push("    $this->fakeOutsideWorld();".into());
         // the bodies are written for a class body (8 spaces); the block indents them again
         lines.extend(
@@ -676,6 +677,7 @@ fn members(config: &Config, tests: &[(String, Vec<String>)]) -> Vec<String> {
         lines.push("}".into());
         out.push(lines.join("\n"));
     }
+    out.push(testgen::ROLLBACK_HELPER.to_string());
     out.push(format!(
         "/** Mail, notifications, queued jobs and HTTP calls are faked: a generated test sends nothing. */
 private function fakeOutsideWorld(){ret}
@@ -775,7 +777,15 @@ pub fn generate(config: &Config, skip: &HashSet<(String, String)>) -> Written {
         };
         let mut taken = testgen::taken_names(existing.as_deref());
         // the helpers the generated tests call
-        taken.extend(["fakeOutsideWorld", "generatedRow", "assertGeneratedType"].map(String::from));
+        taken.extend(
+            [
+                "fakeOutsideWorld",
+                "generatedRow",
+                "assertGeneratedType",
+                testgen::ROLLBACK,
+            ]
+            .map(String::from),
+        );
         let mut tests = vec![];
         for row in rows {
             let method = row["method"].as_str().unwrap_or_default();

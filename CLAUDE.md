@@ -39,6 +39,8 @@ runner each app's own PHP executes (embedded in the binary with `include_str!`).
   has MARKER in its class docblock; in a test file someone wrote, the generated tests sit in a block
   (`src/testfile.rs`: `// <laravel-parity>` ... `// </laravel-parity>`) that each run replaces, and the coverage
   fingerprint and the "route has a test" check ignore. Every generated method carries the group, not the class.
+  Every generated test calls `rollBackAfterGeneratedTest()` first (its own transaction, rolled back when it ends: no
+  trait added to a class someone wrote), and a feature test sends the case's query string (`array $query` column).
 - `src/factories.rs` writes a factory for each HasFactory model without one (Laravel 8+, MARKER, checked by making a
   row through probe mode on the new app; a database error fixes the column it names, else the factory is not kept).
 - The AI loop: coverage_gaps -> write a test in group laravel-parity-ai, inside a `// <laravel-parity-ai>` block in

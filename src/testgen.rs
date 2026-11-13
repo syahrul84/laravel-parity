@@ -28,6 +28,28 @@ pub const GROUP: &str = "laravel-parity";
 /// The group of tests an AI assistant writes from the coverage gaps: not the app's own (measured with the generated
 /// ones), never overwritten by the tool.
 pub const AI_GROUP: &str = "laravel-parity-ai";
+/// The helper every generated test calls first: what it saves (the signed-in user, factory rows, what the request
+/// writes) is rolled back when the test ends, as DatabaseTransactions does, without adding that trait to a class
+/// someone wrote (it would change how their own tests run). A route that runs DDL (an implicit commit in MySQL) can
+/// still leave rows behind.
+pub const ROLLBACK: &str = "rollBackAfterGeneratedTest";
+pub const ROLLBACK_HELPER: &str = "/** What the test saves is rolled back when it ends, as DatabaseTransactions does. */
+private function rollBackAfterGeneratedTest()
+{
+    $database = $this->app->make('db');
+    $names = property_exists($this, 'connectionsToTransact') ? $this->connectionsToTransact : [null];
+    foreach ($names as $name) {
+        $database->connection($name)->beginTransaction();
+    }
+    $this->beforeApplicationDestroyed(function () use ($database, $names) {
+        foreach ($names as $name) {
+            $connection = $database->connection($name);
+            if ($connection->transactionLevel() > 0) {
+                $connection->rollBack();
+            }
+        }
+    });
+}";
 /// Generated test files per PHPUnit run when the run of the whole group dies.
 const BATCH: usize = 100;
 const TESTABLE: [i64; 10] = [200, 201, 202, 204, 400, 401, 403, 404, 409, 422];
@@ -306,6 +328,8 @@ struct Row {
     sign_in: bool,
     missing: bool,
     body: Value,
+    /// the query string `run` sent (learned from validation errors, or given by hand)
+    query: Value,
     without: Vec<String>,
     status: i64,
     structure: String,
@@ -372,6 +396,7 @@ fn build_route(
             sign_in: spec.guard.is_some(),
             missing: spec.case == "missing",
             body,
+            query: Value::Object(spec.query.clone().unwrap_or_default()),
             without: spec.without.clone(),
             status,
             structure,
@@ -441,6 +466,7 @@ fn build_route(
 
     // the expectations were recorded with every middleware on: a class that `use WithoutMiddleware` would let a guest
     // case through the auth middleware it expects to stop it
+    lines.push(format!("$this->{ROLLBACK}();"));
     lines.push("$this->withMiddleware();".into());
     lines.push("$user = null;".into());
     // the guard of any case that signs in: with --drop-failing the happy case may be gone while a signed-in one
@@ -488,14 +514,19 @@ fn build_route(
             }
         }
         lines.push(format!(
-            "$fill = [{}];\narray_walk_recursive($data, function (&$value) use ($fill) {{\n    if (is_string($value) && array_key_exists($value, $fill)) {{\n        $value = $fill[$value];\n    }}\n}});",
+            "$fill = [{}];\n$put = function (&$value) use ($fill) {{\n    if (is_string($value) && array_key_exists($value, $fill)) {{\n        $value = $fill[$value];\n    }}\n}};\narray_walk_recursive($data, $put);\narray_walk_recursive($query, $put);",
             fills.join(", ")
         ));
     }
     lines.push("foreach ($without as $field) {\n    unset($data[$field]);\n}".into());
+    // the query string the case was sent with, as `run` sent it
+    lines.push(format!("$uri = \"{uri}\";"));
+    lines.push(
+        "if ($query !== []) {\n    $uri .= (strpos($uri, '?') === false ? '?' : '&').http_build_query($query);\n}".into(),
+    );
     lines.push(String::new());
     lines.push(format!(
-        "$response = $this->json({}, \"{uri}\", $data);",
+        "$response = $this->json({}, $uri, $data);",
         php_string(&happy.method)
     ));
     lines.push(String::new());
@@ -523,7 +554,7 @@ fn build_route(
         function.push(" */".into());
     }
     function.push(format!(
-        "public function {name}(bool $signIn, bool $missing, array $body, array $without, int $status, array $structure, array $errors): void"
+        "public function {name}(bool $signIn, bool $missing, array $body, array $query, array $without, int $status, array $structure, array $errors): void"
     ));
     function.push("{".into());
     function.extend(lines.join("\n").lines().map(|l| {
@@ -537,17 +568,18 @@ fn build_route(
     function.push(String::new());
     function.push(format!("public static function {provider}(): array"));
     function.push("{".into());
-    function.push("    // case => [sign in, missing record, body, fields left out, status, JSON keys, validation errors]".into());
+    function.push("    // case => [sign in, missing record, body, query, fields left out, status, JSON keys, validation errors]".into());
     function.push("    return [".into());
     for row in &rows {
         let without: Vec<String> = row.without.iter().map(|f| php_string(f)).collect();
         let errors: Vec<String> = row.errors.iter().map(|f| php_string(f)).collect();
         function.push(format!(
-            "        {} => [{}, {}, {}, [{}], {}, {}, [{}]],",
+            "        {} => [{}, {}, {}, {}, [{}], {}, {}, [{}]],",
             php_string(&row.case),
             row.sign_in,
             row.missing,
             php_value(&row.body),
+            php_value(&row.query),
             without.join(", "),
             row.status,
             row.structure,
@@ -736,6 +768,7 @@ pub fn generate(
             _ => place.fqcn(),
         };
         let mut taken = taken_names(existing.as_deref());
+        taken.insert(ROLLBACK.to_string());
         let mut methods = vec![];
         for (key, cases) in entries {
             let name = method_name(&key, &mut taken);
@@ -762,6 +795,7 @@ pub fn generate(
             testfile::clear(&file);
             continue;
         }
+        methods.push(ROLLBACK_HELPER.to_string());
         if let Some(parent) = file.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1131,9 +1165,9 @@ mod tests {
             &skip,
         );
         let php = std::fs::read_to_string(&out.files[0]).unwrap();
-        assert!(php.contains("        $this->withMiddleware();\n        $user = null;\n        if ($signIn) {\n            $user = \\App\\Models\\User::factory()->create();"));
+        assert!(php.contains("        $this->rollBackAfterGeneratedTest();\n        $this->withMiddleware();\n        $user = null;\n        if ($signIn) {\n            $user = \\App\\Models\\User::factory()->create();"));
         assert!(!php.contains("'happy' =>"));
-        assert!(php.contains("'empty' => [true, false,"));
+        assert!(php.contains("'empty' => [true, false, [], [], [], 200"));
         assert!(php.contains("'guest' => [false, false,"));
     }
 
@@ -1155,6 +1189,10 @@ mod tests {
         ] {
             let mut s = spec(id, "GET api/shops/{shop}", case, Some(show));
             s.sources.insert("shop".into(), "shops.id".into());
+            if case == "happy" {
+                // learned from the old app's validation errors: run sends it, so the test must too
+                s.query = Some(serde_json::from_value(json!({"project_id": 5})).unwrap());
+            }
             s.body = Some(json!({"ignored": "for GET"}));
             specs.push(s);
         }
@@ -1279,21 +1317,26 @@ mod tests {
             "    // <laravel-parity> generated",
             "    /** GET api/shops/{shop} */",
             "    /**\n     * @dataProvider cases_get_api_shops_shop\n     * @group laravel-parity\n     */",
-            "    public function test_get_api_shops_shop(bool $signIn, bool $missing, array $body, array $without, int $status, array $structure, array $errors): void",
+            "    public function test_get_api_shops_shop(bool $signIn, bool $missing, array $body, array $query, array $without, int $status, array $structure, array $errors): void",
+            "        $this->rollBackAfterGeneratedTest();",
+            "    private function rollBackAfterGeneratedTest()",
             "        $shop = \\App\\Models\\Shop::factory()->create([]);",
             "        $shopKey = $missing ? 999999999 : $shop->getKey();",
             "            $user = \\App\\Models\\User::factory()->create(); $this->actingAs($user, \"api\");",
             "        $this->withHeaders(['X-Shop' => (string) $user?->shop_id]);",
             "        $data = array_merge(['page' => 1], $body);",
-            "        $response = $this->json('GET', \"api/shops/{$shopKey}\", $data);",
-            "            'happy' => [true, false, [], [], 200, ['data' => ['id', 'name']], []],",
-            "            'guest' => [false, false, [], [], 401, [], []],",
+            "        $uri = \"api/shops/{$shopKey}\";",
+            "            $uri .= (strpos($uri, '?') === false ? '?' : '&').http_build_query($query);",
+            "        $response = $this->json('GET', $uri, $data);",
+            "            'happy' => [true, false, [], ['project_id' => 5], [], 200, ['data' => ['id', 'name']], []],",
+            "            'guest' => [false, false, [], [], [], 401, [], []],",
             "        $order = \\App\\Models\\Order::factory()->create(['owner_shop_id' => $shop->id]);",
             "        $data = array_merge(['locale' => 'en', 'owner' => $user?->id], $body);",
             "        $fill = ['{user}' => $user?->getKey(), '{order}' => $orderKey];",
-            "        $response = $this->json('PUT', \"api/orders/{$orderKey}\", $data);",
-            r"            'happy' => [true, false, ['name' => 'it\'s \\ $5', 'shop' => '{order}'], [], 204, [], []],",
-            "            'without-name' => [true, false, [], ['name'], 422, [], ['name']],",
+            "        $uri = \"api/orders/{$orderKey}\";",
+            "        array_walk_recursive($query, $put);",
+            r"            'happy' => [true, false, ['name' => 'it\'s \\ $5', 'shop' => '{order}'], [], [], 204, [], []],",
+            "            'without-name' => [true, false, [], [], ['name'], 422, [], ['name']],",
         ] {
             assert!(php.contains(line), "missing {line:?} in\n{php}");
         }
@@ -1354,6 +1397,7 @@ mod tests {
         assert!(php.contains("$fill = ['{user}' => $user?->getKey()];"));
         assert!(!php.contains("$this->withHeaders"));
         assert!(!php.contains("if ($signIn)"));
-        assert!(php.contains("$response = $this->json('GET', \"api/ping\", $data);"));
+        assert!(php.contains("$uri = \"api/ping\";"));
+        assert!(php.contains("$response = $this->json('GET', $uri, $data);"));
     }
 }
